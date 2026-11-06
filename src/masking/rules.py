@@ -4,25 +4,29 @@ Livelli disponibili:
   none     nessun masking (solo la pulizia comune, vedi clean.py)
   limited  MBTI: solo le menzioni del tipo DELL'UTENTE STESSO
            Big Five: solo i NUMERI dei punteggi (i nomi dei tratti restano)
-  full     le regex originali (tipi, funzioni cognitive, vocabolario)
+  full     regex di tipi MBTI, funzioni cognitive, vocabolario
            + mascheramento dei punteggi Big Five
+           + RIMOZIONE COMPLETA dei commenti scritti nei subreddit della lista
+             configs/excluded_subreddits.txt (filtro sulle righe: vedi pipeline.py)
+  llm      masking tramite LLM, non affrontato in questo file
 
 Segnaposto:
-  TYPE_MENTION     tipi MBTI e vocabolario (come in PANDORA e nel notebook originale)
+  TYPE_MENTION     tipi MBTI e vocabolario
   COGFUNC_MENTION  funzioni cognitive
-  SCORE_MENTION    numeri dei punteggi Big Five (nuovo)
+  SCORE_MENTION    numeri dei punteggi Big Five
 """
 from __future__ import annotations
 
 import re
 from functools import lru_cache
+from pathlib import Path
 
 PH_TYPE = "TYPE_MENTION"
 PH_FUNC = "COGFUNC_MENTION"
 PH_SCORE = "SCORE_MENTION"
 
 # ---------------------------------------------------------------------------
-# Regex originali (invariate rispetto al notebook PREPROCESSING__masking)
+# Tipi e funzioni cognitive MBTI
 # ---------------------------------------------------------------------------
 TYPE_RE = re.compile(r"\b[EI][NS][TF][JP](?:s|'s)?\b", re.I)
 FUNC_RE = re.compile(
@@ -37,7 +41,7 @@ VOCAB_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Punteggi Big Five (nuovo)
+# Punteggi Big Five
 # ---------------------------------------------------------------------------
 _TRAIT = (
     r"(?:openness(?:\s+to\s+(?:new\s+)?experiences?)?|conscientiousness|extraversion|"
@@ -104,6 +108,39 @@ def mask_bigfive_scores(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Subreddit da escludere (filtro sulle RIGHE, applicato in pipeline.py)
+# ---------------------------------------------------------------------------
+# Livelli che scartano interamente i commenti dei subreddit in lista.
+DROP_SUBREDDIT_LEVELS = ("full",)
+
+_HEADER_WORDS = {"subreddit", "subreddits"}
+
+
+def normalize_subreddit(name) -> str:
+    """'r/INTJ ' -> 'intj'. Reddit ignora maiuscole/minuscole nei nomi dei subreddit."""
+    s = str(name).strip().lower()
+    return re.sub(r"^/?r/", "", s)
+
+
+def load_excluded_subreddits(path) -> set[str]:
+    """Legge la lista dei subreddit da escludere.
+
+    Accetta un .txt (un nome per riga) oppure un .csv: per ogni riga usa l'ULTIMO
+    campo, quindi "5,entp" -> "entp". Ignora righe vuote e righe che iniziano con #.
+    """
+    names: set[str] = set()
+    with open(Path(path), encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name = normalize_subreddit(line.split(",")[-1])
+            if name and name not in _HEADER_WORDS:
+                names.add(name)
+    return names
+
+
+# ---------------------------------------------------------------------------
 # Livelli
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=32)
@@ -129,6 +166,7 @@ def mask_full(text: str) -> str:
 
     L'ordine conta: i punteggi vanno mascherati PRIMA del vocabolario, altrimenti
     "openness 85" diventa "TYPE_MENTION 85" e il numero non e' piu' riconoscibile.
+    (Lo scarto dei commenti per subreddit non e' qui: agisce sulle righe, vedi pipeline.py.)
     """
     t = TYPE_RE.sub(PH_TYPE, text)
     t = FUNC_RE.sub(PH_FUNC, t)

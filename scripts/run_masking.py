@@ -16,6 +16,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.masking import DATASETS, LEVELS, load_author_types, process_dataset  # noqa: E402
+from src.masking.rules import DROP_SUBREDDIT_LEVELS, load_excluded_subreddits  # noqa: E402
+
+DEFAULT_EXCLUDED = Path(__file__).resolve().parents[1] / "configs" / "excluded_subreddits.txt"
 
 
 def main():
@@ -29,6 +32,10 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=200_000)
     ap.add_argument("--min-words", type=int, default=5)
     ap.add_argument("--max-words", type=int, default=500)
+    ap.add_argument("--excluded-subreddits", default=str(DEFAULT_EXCLUDED),
+                    help="lista dei subreddit i cui commenti il livello FULL scarta del tutto (.txt o .csv)")
+    ap.add_argument("--no-subreddit-filter", action="store_true",
+                    help="disattiva lo scarto dei subreddit (il livello full tiene tutte le righe)")
     ap.add_argument("--force", action="store_true", help="rifa anche gli output gia' presenti")
     args = ap.parse_args()
 
@@ -45,11 +52,19 @@ def main():
     if needs_types:
         print(f"Tipi MBTI noti per {len(author_types):,} autori ({profiles.name})")
 
+    excluded = set()
+    if not args.no_subreddit_filter and any(lv in DROP_SUBREDDIT_LEVELS for lv in args.levels):
+        path = Path(args.excluded_subreddits)
+        if not path.exists():
+            ap.error(f"lista subreddit non trovata: {path} (usa --excluded-subreddits o --no-subreddit-filter)")
+        excluded = load_excluded_subreddits(path)
+        print(f"Subreddit esclusi dal livello full: {len(excluded)} ({path.name})")
+
     for name in args.datasets:
         process_dataset(
             name, data_dir, out_dir, args.levels, author_types,
             chunk_size=args.chunk_size, min_words=args.min_words,
-            max_words=args.max_words, force=args.force,
+            max_words=args.max_words, force=args.force, excluded_subreddits=excluded,
         )
 
 

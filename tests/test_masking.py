@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.masking import (mask_bigfive_scores, mask_full, mask_limited,
                          load_author_types, process_dataset)
+from src.masking.rules import load_excluded_subreddits
 
 
 def test_full_mbti():
@@ -75,6 +76,50 @@ def test_pipeline_end_to_end(tmp_path):
     none = pd.read_csv(out / "none" / "comments_final.csv", keep_default_na=False)
     assert "INTJ" in none.body[0]
     assert process_dataset("final", data, out, ["full", "limited", "none"], types) is None
+
+
+def test_load_excluded_subreddits(tmp_path):
+    p = tmp_path / "s.csv"
+    p.write_text("5,entp\n7,MBTI\n\n9,r/INTJ\n# commento\n", encoding="utf-8")
+    assert load_excluded_subreddits(p) == {"entp", "mbti", "intj"}
+
+
+def test_full_drops_excluded_subreddits_only(tmp_path):
+    data, out = tmp_path / "d", tmp_path / "o"
+    data.mkdir()
+    pd.DataFrame({"author": ["a"], "mbti": ["intj"]}).to_csv(data / "author_profiles.csv", index=False)
+    rows = [
+        ("a", "I really like talking about my own personality type here", "INTJ"),
+        ("a", "Weather was great and we went hiking for several hours", "hiking"),
+        ("a", "Another long comment about cooking pasta for the whole family", "r/Cooking"),
+        ("a", "Posting this one in the mbti subreddit where everyone talks", "mbti"),
+    ]
+    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
+    types = load_author_types(data / "author_profiles.csv")
+    st = process_dataset("final", data, out, ["none", "limited", "full"], types,
+                         chunk_size=3, excluded_subreddits={"intj", "mbti"})
+    full = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
+    none = pd.read_csv(out / "none" / "comments_final.csv", keep_default_na=False)
+    lim = pd.read_csv(out / "limited" / "comments_final.csv", keep_default_na=False)
+    assert list(full.subreddit) == ["hiking", "r/Cooking"]          # r/INTJ e r/mbti scartati (anche con maiuscole)
+    assert len(none) == 4 and len(lim) == 4                          # gli altri livelli tengono tutto
+    assert st["rows_out_by_level"] == {"none": 4, "limited": 4, "full": 2}
+    assert st["dropped_excluded_subreddit_by_level"]["full"] == 2
+    # senza lista, full tiene tutte le righe
+    out2 = tmp_path / "o2"
+    st2 = process_dataset("final", data, out2, ["full"], types)
+    assert st2["rows_out_by_level"]["full"] == 4
+
+
+def test_full_all_rows_excluded_gives_header_only_file(tmp_path):
+    data, out = tmp_path / "d", tmp_path / "o"
+    data.mkdir()
+    pd.DataFrame({"author": ["a"], "mbti": ["intj"]}).to_csv(data / "author_profiles.csv", index=False)
+    pd.DataFrame([("a", "A perfectly fine long enough comment for the filter", "intj")],
+                 columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
+    process_dataset("final", data, out, ["full"], {}, excluded_subreddits={"intj"})
+    res = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
+    assert len(res) == 0 and list(res.columns) == ["author", "body", "subreddit"]
 
 
 if __name__ == "__main__":
