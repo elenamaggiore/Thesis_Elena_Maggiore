@@ -56,29 +56,100 @@ def test_no_false_positive_plain_text():
 def test_pipeline_end_to_end(tmp_path):
     data, out = tmp_path / "d", tmp_path / "o"
     data.mkdir()
-    pd.DataFrame({"author": ["a", "b"], "mbti": ["intj", ""],
-                  "openness": ["80", "None"], "conscientiousness": ["10", "20"],
-                  "extraversion": ["30", "40"], "agreeableness": ["50", "60"],
-                  "neuroticism": ["70", "80"]}).to_csv(data / "author_profiles.csv", index=False)
+
+    pd.DataFrame({
+        "author": ["a", "b"],
+        "mbti": ["intj", ""],
+        "openness": ["80", "None"],
+        "conscientiousness": ["10", "20"],
+        "extraversion": ["30", "40"],
+        "agreeableness": ["50", "60"],
+        "neuroticism": ["70", "80"],
+    }).to_csv(data / "author_profiles.csv", index=False)
+
     rows = [
         ("a", "I am an INTJ and my sister is an ENFP, we like long walks outside", "x"),
         ("b", "My scores were openness 85 and conscientiousness 40 on the test", "y"),
         ("a", "[deleted]", "x"),
         ("a", "too short", "x"),
     ]
-    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
-    types = load_author_types(data / "author_profiles.csv", "mbti")
-    assert types == {"a": {"mbti": "INTJ"}}
-    stats = process_dataset("final", data, out, ["full", "limited", "none"], types, chunk_size=2)
-    assert stats["rows_in"] == 4 and stats["rows_kept"] == 2
-    lim = pd.read_csv(out / "limited" / "comments_final.csv", keep_default_na=False)
-    assert "INTJ" not in lim.body[0] and "ENFP" in lim.body[0]
-    assert "85" not in lim.body[1] and "openness" in lim.body[1]
-    full = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
-    assert "ENFP" not in full.body[0] and "openness" not in full.body[1].lower()
-    none = pd.read_csv(out / "none" / "comments_final.csv", keep_default_na=False)
+
+    pd.DataFrame(
+        rows, columns=["author", "body", "subreddit"]
+    ).to_csv(data / "comments_big_five.csv", index=False)
+
+    # Caricamento delle etichette Big Five.
+    types = load_author_types(data / "author_profiles.csv", "big_five")
+
+    assert set(types) == {"a"}
+    assert types["a"] == {
+        "openness": 80.0,
+        "conscientiousness": 10.0,
+        "extraversion": 30.0,
+        "agreeableness": 50.0,
+        "neuroticism": 70.0,
+    }
+
+    stats = process_dataset(
+        "big_five", data, out,
+        ["full", "limited", "none"],
+        types,
+        chunk_size=2,
+    )
+
+    assert stats["rows_in"] == 4
+    assert stats["rows_kept"] == 2
+    assert stats["rows_without_big_five"] == 1
+
+    # LIMITED: maschera i numeri dei punteggi Big Five,
+    # ma non i nomi dei tratti né i tipi MBTI.
+    lim = pd.read_csv(
+        out / "limited" / "comments_big_five.csv",
+        keep_default_na=False,
+    )
+
+    assert "INTJ" in lim.body[0]
+    assert "ENFP" in lim.body[0]
+
+    assert "SCORE_MENTION" in lim.body[1]
+    assert "85" not in lim.body[1]
+    assert "40" not in lim.body[1]
+    assert "openness" in lim.body[1].lower()
+    assert "conscientiousness" in lim.body[1].lower()
+
+    # FULL: maschera tipi MBTI e vocabolario Big Five.
+    full = pd.read_csv(
+        out / "full" / "comments_big_five.csv",
+        keep_default_na=False,
+    )
+
+    assert "INTJ" not in full.body[0]
+    assert "ENFP" not in full.body[0]
+    assert "TYPE_MENTION" in full.body[0]
+
+    assert "openness" not in full.body[1].lower()
+    assert "conscientiousness" not in full.body[1].lower()
+    assert "SCORE_MENTION" in full.body[1]
+
+    # NONE: nessun masking.
+    none = pd.read_csv(
+        out / "none" / "comments_big_five.csv",
+        keep_default_na=False,
+    )
+
     assert "INTJ" in none.body[0]
-    assert process_dataset("final", data, out, ["full", "limited", "none"], types) is None
+    assert "ENFP" in none.body[0]
+    assert "openness" in none.body[1].lower()
+    assert "conscientiousness" in none.body[1].lower()
+    assert "85" in none.body[1]
+    assert "40" in none.body[1]
+
+    # Gli output esistono già: non deve rielaborare il dataset.
+    assert process_dataset(
+        "big_five", data, out,
+        ["full", "limited", "none"],
+        types,
+    ) is None
 
 
 def test_load_excluded_subreddits(tmp_path):
@@ -97,20 +168,20 @@ def test_full_drops_excluded_subreddits_only(tmp_path):
         ("a", "Another long comment about cooking pasta for the whole family", "r/Cooking"),
         ("a", "Posting this one in the mbti subreddit where everyone talks", "mbti"),
     ]
-    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
+    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_big_five.csv", index=False)
     types = load_author_types(data / "author_profiles.csv", "mbti")
-    st = process_dataset("final", data, out, ["none", "limited", "full"], types,
+    st = process_dataset("big_five", data, out, ["none", "limited", "full"], types,
                          chunk_size=3, excluded_subreddits={"intj", "mbti"})
-    full = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
-    none = pd.read_csv(out / "none" / "comments_final.csv", keep_default_na=False)
-    lim = pd.read_csv(out / "limited" / "comments_final.csv", keep_default_na=False)
+    full = pd.read_csv(out / "full" / "comments_big_five.csv", keep_default_na=False)
+    none = pd.read_csv(out / "none" / "comments_big_five.csv", keep_default_na=False)
+    lim = pd.read_csv(out / "limited" / "comments_big_five.csv", keep_default_na=False)
     assert list(full.subreddit) == ["hiking", "r/Cooking"]          # r/INTJ e r/mbti scartati (anche con maiuscole)
     assert len(none) == 4 and len(lim) == 4                          # gli altri livelli tengono tutto
     assert st["rows_out_by_level"] == {"none": 4, "limited": 4, "full": 2}
     assert st["dropped_excluded_subreddit_by_level"]["full"] == 2
     # senza lista, full tiene tutte le righe
     out2 = tmp_path / "o2"
-    st2 = process_dataset("final", data, out2, ["full"], types)
+    st2 = process_dataset("big_five", data, out2, ["full"], types)
     assert st2["rows_out_by_level"]["full"] == 4
 
 
@@ -119,9 +190,9 @@ def test_full_all_rows_excluded_gives_header_only_file(tmp_path):
     data.mkdir()
     pd.DataFrame({"author": ["a"], "mbti": ["intj"]}).to_csv(data / "author_profiles.csv", index=False)
     pd.DataFrame([("a", "A perfectly fine long enough comment for the filter", "intj")],
-                 columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
-    process_dataset("final", data, out, ["full"], {}, excluded_subreddits={"intj"})
-    res = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
+                 columns=["author", "body", "subreddit"]).to_csv(data / "comments_big_five.csv", index=False)
+    process_dataset("big_five", data, out, ["full"], {}, excluded_subreddits={"intj"})
+    res = pd.read_csv(out / "full" / "comments_big_five.csv", keep_default_na=False)
     assert len(res) == 0 and list(res.columns) == ["author", "body", "subreddit"]
 
 
