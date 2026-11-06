@@ -1,10 +1,5 @@
 """Applica il masking a tutti i dataset PANDORA con un solo comando.
 
-Esempio (Colab):
-  python scripts/run_masking.py \
-      --data-dir "/content/drive/MyDrive/Thesis_Elena_Maggiore/Datasets" \
-      --out-dir  "/content/drive/MyDrive/Thesis_Elena_Maggiore/Datasets_masked"
-
 Output:  <out-dir>/<livello>/comments_<dataset>.csv   (+ masking_stats_<dataset>.json)
 I file originali non vengono modificati.
 """

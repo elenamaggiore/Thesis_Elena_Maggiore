@@ -4,10 +4,6 @@ Ogni dataset viene letto UNA volta; la pulizia e' calcolata una volta e poi
 applicata a tutti i livelli richiesti. I file originali non vengono mai toccati:
 l'output va in  <out_dir>/<livello>/<stesso nome del file di input>.
 
-ATTENZIONE: i livelli in DROP_SUBREDDIT_LEVELS (oggi solo "full") scartano per intero
-i commenti scritti nei subreddit della lista di esclusione. Quei livelli hanno quindi
-MENO righe degli altri: il confronto riga-per-riga tra livelli non e' piu' valido,
-va fatto per chiave (autore + testo) o dopo aver filtrato anche gli altri file.
 """
 from __future__ import annotations
 
@@ -27,7 +23,6 @@ from .rules import DROP_SUBREDDIT_LEVELS, mask_text, normalize_subreddit
 DATASETS = {
     "mbti": {"file": "comments_mbti.csv", "rules": ("mbti",)},
     "big_five": {"file": "comments_big_five.csv", "rules": ("bigfive",)},
-    "final": {"file": "comments_final.csv", "rules": ("mbti", "bigfive")},
 }
 
 # Colonne dei punteggi Big Five in author_profiles.csv
@@ -41,7 +36,6 @@ def load_author_types(profiles_path: Path, dataset: str) -> dict[str, dict]:
       "mbti"      tipo MBTI valido (4 lettere, come prima)            -> {"mbti": "INTJ"}
       "big_five"  openness, conscientiousness, extraversion,
                   agreeableness e neuroticism TUTTI NOT NULL          -> {"openness": 85.0, ...}
-      "final"     entrambe le condizioni                              -> {"mbti": ..., "openness": ...}
 
     Gli autori che non soddisfano le condizioni NON compaiono nel risultato. Quindi,
     per ogni autore restituito, le etichette richieste sono sempre definite: chi usa
@@ -115,7 +109,7 @@ def process_dataset(
         tmp[lv].unlink(missing_ok=True)
 
     shared = Counter()                       # righe lette / scartate dalla pulizia (uguali per ogni livello)
-    changed = {lv: 0 for lv in todo}         # commenti modificati dal masking
+    changed = {lv: 0 for lv in todo}         # righe modificate dal masking
     rows_out = {lv: 0 for lv in todo}        # righe scritte per livello
     dropped_sub = {lv: 0 for lv in todo}     # righe scartate per subreddit in lista
     first = {lv: True for lv in todo}

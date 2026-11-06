@@ -154,14 +154,6 @@ def test_load_author_types_big_five_not_null(tmp_path):
     assert all(isinstance(v, float) for lab in got.values() for v in lab.values())   # sempre definiti
 
 
-def test_load_author_types_final_needs_both(tmp_path):
-    _profiles(tmp_path / "p.csv")
-    got = load_author_types(tmp_path / "p.csv", "final")
-    assert set(got) == {"ok", "dup"}
-    assert "null_trait" not in got and "none_str" not in got and "bad_type" not in got
-    assert got["ok"]["mbti"] == "INTJ" and got["ok"]["openness"] == 85.0
-
-
 def test_load_author_types_errors(tmp_path):
     pd.DataFrame({"author": ["a"], "mbti": ["intj"]}).to_csv(tmp_path / "p.csv", index=False)
     try:
