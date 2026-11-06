@@ -16,6 +16,7 @@ import os
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .clean import prepare_comment
@@ -29,15 +30,56 @@ DATASETS = {
     "final": {"file": "comments_final.csv", "rules": ("mbti", "bigfive")},
 }
 
+# Colonne dei punteggi Big Five in author_profiles.csv
+BIG_FIVE_COLS = ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")
 
-def load_author_types(profiles_path: Path) -> dict[str, str]:
-    """author -> tipo MBTI (maiuscolo, a 4 lettere); scarta valori mancanti/invalidi."""
-    df = pd.read_csv(
-        profiles_path, usecols=["author", "mbti"], dtype=str, keep_default_na=False
-    )
-    df["mbti"] = df["mbti"].str.strip().str.upper()
-    valid = df["mbti"].str.fullmatch(r"[EI][NS][TF][JP]")
-    return dict(zip(df.loc[valid, "author"], df.loc[valid, "mbti"]))
+
+def load_author_types(profiles_path: Path, dataset: str) -> dict[str, dict]:
+    """Etichette valide per gli autori di un dataset: autore -> {etichetta: valore}.
+
+    Cosa viene richiesto dipende dal dataset (vedi DATASETS[dataset]["rules"]):
+      "mbti"      tipo MBTI valido (4 lettere, come prima)            -> {"mbti": "INTJ"}
+      "big_five"  openness, conscientiousness, extraversion,
+                  agreeableness e neuroticism TUTTI NOT NULL          -> {"openness": 85.0, ...}
+      "final"     entrambe le condizioni                              -> {"mbti": ..., "openness": ...}
+
+    Gli autori che non soddisfano le condizioni NON compaiono nel risultato. Quindi,
+    per ogni autore restituito, le etichette richieste sono sempre definite: chi usa
+    il risultato non deve controllare None/NaN. "NOT NULL" vale per celle vuote e
+    per i marcatori di mancante ("None", "NA", "nan", "<NA>", ...), perche' i valori
+    non numerici diventano NaN e vengono scartati.
+    """
+    if dataset not in DATASETS:
+        raise ValueError(f"Dataset sconosciuto: {dataset!r} (validi: {list(DATASETS)})")
+    rules = DATASETS[dataset]["rules"]
+    need_mbti, need_b5 = "mbti" in rules, "bigfive" in rules
+
+    cols = ["author"] + (["mbti"] if need_mbti else []) + (list(BIG_FIVE_COLS) if need_b5 else [])
+    header = pd.read_csv(profiles_path, nrows=0).columns
+    missing = [c for c in cols if c not in header]
+    if missing:
+        raise ValueError(
+            f"{Path(profiles_path).name}: mancano le colonne {missing} richieste "
+            f"per il dataset {dataset!r}")
+
+    df = pd.read_csv(profiles_path, usecols=cols, dtype=str, keep_default_na=False)
+    valid = pd.Series(True, index=df.index)
+
+    if need_mbti:
+        df["mbti"] = df["mbti"].str.strip().str.upper()
+        valid &= df["mbti"].str.fullmatch(r"[EI][NS][TF][JP]")
+
+    if need_b5:
+        scores = df[list(BIG_FIVE_COLS)].apply(pd.to_numeric, errors="coerce").astype("float64")
+        valid &= pd.Series(np.isfinite(scores.to_numpy()).all(axis=1), index=df.index)
+        df[list(BIG_FIVE_COLS)] = scores
+
+    labels = {}
+    for rec in df.loc[valid, cols].to_dict("records"):
+        labels[rec.pop("author")] = rec
+    print(f"[profili:{dataset}] {len(labels):,} autori con etichette valide "
+          f"su {len(df):,} righe di {Path(profiles_path).name}")
+    return labels
 
 
 def process_dataset(
@@ -45,13 +87,14 @@ def process_dataset(
     data_dir: Path,
     out_dir: Path,
     levels: list[str],
-    author_types: dict[str, str],
+    author_types: dict[str, dict],
     chunk_size: int = 200_000,
     min_words: int = 5,
     max_words: int = 500,
     force: bool = False,
     excluded_subreddits: set[str] | None = None,
 ) -> dict | None:
+    """author_types: risultato di load_author_types(profiles, name)."""
     spec = DATASETS[name]
     rules = spec["rules"]
     excluded = set(excluded_subreddits or ())
@@ -76,7 +119,8 @@ def process_dataset(
     rows_out = {lv: 0 for lv in todo}        # righe scritte per livello
     dropped_sub = {lv: 0 for lv in todo}     # righe scartate per subreddit in lista
     first = {lv: True for lv in todo}
-    no_type = 0                              # righe MBTI senza tipo noto per l'autore
+    no_type = 0                              # righe senza tipo MBTI valido per l'autore
+    no_b5 = 0                                # righe senza Big Five completo per l'autore
     cols = None
 
     try:
@@ -106,9 +150,12 @@ def process_dataset(
                 continue
 
             base = chunk.iloc[keep]
-            own = [author_types.get(authors[j]) for j in keep]
+            labels = [author_types.get(authors[j]) for j in keep]   # None se l'autore non ha etichette valide
+            own = [(lab or {}).get("mbti") for lab in labels]       # tipo MBTI dell'autore (o None)
             if "mbti" in rules:
                 no_type += sum(1 for o in own if o is None)
+            if "bigfive" in rules:
+                no_b5 += sum(1 for lab in labels if lab is None)
 
             if excluded:
                 in_excluded = [normalize_subreddit(s) in excluded
@@ -156,6 +203,7 @@ def process_dataset(
         "dropped_bad": shared["bad"],
         "dropped_short": shared["short"],
         "rows_without_known_type": no_type if "mbti" in rules else None,
+        "rows_without_big_five": no_b5 if "bigfive" in rules else None,
         "excluded_subreddits_n": len(excluded),
         "rows_out_by_level": rows_out,
         "dropped_excluded_subreddit_by_level": dropped_sub,

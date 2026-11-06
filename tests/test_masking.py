@@ -56,7 +56,10 @@ def test_no_false_positive_plain_text():
 def test_pipeline_end_to_end(tmp_path):
     data, out = tmp_path / "d", tmp_path / "o"
     data.mkdir()
-    pd.DataFrame({"author": ["a", "b"], "mbti": ["intj", ""]}).to_csv(data / "author_profiles.csv", index=False)
+    pd.DataFrame({"author": ["a", "b"], "mbti": ["intj", ""],
+                  "openness": ["80", "None"], "conscientiousness": ["10", "20"],
+                  "extraversion": ["30", "40"], "agreeableness": ["50", "60"],
+                  "neuroticism": ["70", "80"]}).to_csv(data / "author_profiles.csv", index=False)
     rows = [
         ("a", "I am an INTJ and my sister is an ENFP, we like long walks outside", "x"),
         ("b", "My scores were openness 85 and conscientiousness 40 on the test", "y"),
@@ -64,8 +67,8 @@ def test_pipeline_end_to_end(tmp_path):
         ("a", "too short", "x"),
     ]
     pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
-    types = load_author_types(data / "author_profiles.csv")
-    assert types == {"a": "INTJ"}
+    types = load_author_types(data / "author_profiles.csv", "mbti")
+    assert types == {"a": {"mbti": "INTJ"}}
     stats = process_dataset("final", data, out, ["full", "limited", "none"], types, chunk_size=2)
     assert stats["rows_in"] == 4 and stats["rows_kept"] == 2
     lim = pd.read_csv(out / "limited" / "comments_final.csv", keep_default_na=False)
@@ -95,7 +98,7 @@ def test_full_drops_excluded_subreddits_only(tmp_path):
         ("a", "Posting this one in the mbti subreddit where everyone talks", "mbti"),
     ]
     pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
-    types = load_author_types(data / "author_profiles.csv")
+    types = load_author_types(data / "author_profiles.csv", "mbti")
     st = process_dataset("final", data, out, ["none", "limited", "full"], types,
                          chunk_size=3, excluded_subreddits={"intj", "mbti"})
     full = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
@@ -120,6 +123,57 @@ def test_full_all_rows_excluded_gives_header_only_file(tmp_path):
     process_dataset("final", data, out, ["full"], {}, excluded_subreddits={"intj"})
     res = pd.read_csv(out / "full" / "comments_final.csv", keep_default_na=False)
     assert len(res) == 0 and list(res.columns) == ["author", "body", "subreddit"]
+
+
+def _profiles(path):
+    pd.DataFrame({
+        "author": ["ok", "null_trait", "none_str", "bad_type", "dup", "dup"],
+        "mbti": ["intj", "enfp", "infj", "xxxx", "entp", ""],
+        "openness": ["85", "", "60", "50", "10", "20"],
+        "conscientiousness": ["40", "40", "None", "50", "11", "21"],
+        "extraversion": ["22", "22", "22", "50", "12", "22"],
+        "agreeableness": ["75", "75", "75", "50", "13", "23"],
+        "neuroticism": ["60", "60", "60", "50", "14", "24"],
+    }).to_csv(path, index=False)
+
+
+def test_load_author_types_mbti_unchanged(tmp_path):
+    _profiles(tmp_path / "p.csv")
+    got = load_author_types(tmp_path / "p.csv", "mbti")
+    assert got["ok"] == {"mbti": "INTJ"} and "bad_type" not in got
+    assert got["null_trait"] == {"mbti": "ENFP"}          # i Big Five non contano per l'MBTI
+    assert got["dup"] == {"mbti": "ENTP"}                 # la riga col tipo valido
+
+
+def test_load_author_types_big_five_not_null(tmp_path):
+    _profiles(tmp_path / "p.csv")
+    got = load_author_types(tmp_path / "p.csv", "big_five")
+    assert set(got) == {"ok", "bad_type", "dup"}           # celle vuote e "None" escluse; il tipo MBTI non conta
+    assert got["ok"] == {"openness": 85.0, "conscientiousness": 40.0, "extraversion": 22.0,
+                         "agreeableness": 75.0, "neuroticism": 60.0}
+    assert all(isinstance(v, float) for lab in got.values() for v in lab.values())   # sempre definiti
+
+
+def test_load_author_types_final_needs_both(tmp_path):
+    _profiles(tmp_path / "p.csv")
+    got = load_author_types(tmp_path / "p.csv", "final")
+    assert set(got) == {"ok", "dup"}
+    assert "null_trait" not in got and "none_str" not in got and "bad_type" not in got
+    assert got["ok"]["mbti"] == "INTJ" and got["ok"]["openness"] == 85.0
+
+
+def test_load_author_types_errors(tmp_path):
+    pd.DataFrame({"author": ["a"], "mbti": ["intj"]}).to_csv(tmp_path / "p.csv", index=False)
+    try:
+        load_author_types(tmp_path / "p.csv", "big_five")
+        assert False, "doveva dare errore: mancano le colonne Big Five"
+    except ValueError as e:
+        assert "openness" in str(e)
+    try:
+        load_author_types(tmp_path / "p.csv", "boh")
+        assert False
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":

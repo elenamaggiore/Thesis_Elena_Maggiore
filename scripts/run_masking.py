@@ -26,7 +26,7 @@ def main():
     ap.add_argument("--data-dir", default=os.environ.get("DATA_DIR"), help="cartella dei comments_*.csv")
     ap.add_argument("--out-dir", default=os.environ.get("OUT_DIR"), help="cartella di output")
     ap.add_argument("--profiles", default="author_profiles.csv",
-                    help="CSV con author e mbti (relativo a --data-dir o percorso assoluto)")
+                    help="CSV con author, mbti e i cinque punteggi Big Five (relativo a --data-dir o assoluto)")
     ap.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=list(DATASETS))
     ap.add_argument("--levels", nargs="+", default=["full", "limited"], choices=list(LEVELS))
     ap.add_argument("--chunk-size", type=int, default=200_000)
@@ -47,10 +47,6 @@ def main():
     profiles = Path(args.profiles)
     if not profiles.is_absolute():
         profiles = data_dir / profiles
-    needs_types = "limited" in args.levels and any("mbti" in DATASETS[d]["rules"] for d in args.datasets)
-    author_types = load_author_types(profiles) if needs_types else {}
-    if needs_types:
-        print(f"Tipi MBTI noti per {len(author_types):,} autori ({profiles.name})")
 
     excluded = set()
     if not args.no_subreddit_filter and any(lv in DROP_SUBREDDIT_LEVELS for lv in args.levels):
@@ -61,6 +57,13 @@ def main():
         print(f"Subreddit esclusi dal livello full: {len(excluded)} ({path.name})")
 
     for name in args.datasets:
+        rules = DATASETS[name]["rules"]
+        # Big Five: il controllo NOT NULL sui cinque punteggi si fa sempre.
+        # MBTI: il tipo dell'autore serve solo al livello limited.
+        needs_labels = "bigfive" in rules or ("limited" in args.levels and "mbti" in rules)
+        if needs_labels and not profiles.exists():
+            ap.error(f"file dei profili non trovato: {profiles} (serve per il dataset {name!r})")
+        author_types = load_author_types(profiles, name) if needs_labels else {}
         process_dataset(
             name, data_dir, out_dir, args.levels, author_types,
             chunk_size=args.chunk_size, min_words=args.min_words,
