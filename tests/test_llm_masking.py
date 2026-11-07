@@ -71,12 +71,12 @@ def test_pipeline_with_mock_and_cache(tmp_path):
         ("d", "[deleted]", "x"),
         ("e", "HACK personality test whole comment is returned as a span", "x"),
     ]
-    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_final.csv", index=False)
+    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(data / "comments_big_five.csv", index=False)
 
     be = MockBackend(_mock_fn)
-    st = process_dataset_llm("final", data, out, be, "mock-model", chunk_size=2, batch_size=2)
+    st = process_dataset_llm("big_five", data, out, be, "mock-model", chunk_size=2, batch_size=2)
     assert st["rows_kept"] == 4 and st["candidates"] == 3 and be.calls == 3
-    res = pd.read_csv(out / "llm" / "comments_final.csv", keep_default_na=False)
+    res = pd.read_csv(out / "llm" / "comments_big_five.csv", keep_default_na=False)
     assert res.body[0].startswith("I am an TYPE_MENTION and")
     assert res.body[1] == rows[1][1]                          # non candidato: intatto
     assert "SCORE_MENTION" in res.body[2] and "openness" in res.body[2]
@@ -85,16 +85,16 @@ def test_pipeline_with_mock_and_cache(tmp_path):
 
     # seconda esecuzione: nessuna nuova chiamata, tutto dalla cache
     be2 = MockBackend(lambda t: (_ for _ in ()).throw(RuntimeError("non deve essere chiamato")))
-    st2 = process_dataset_llm("final", data, out, be2, "mock-model", chunk_size=2, force=True)
+    st2 = process_dataset_llm("big_five", data, out, be2, "mock-model", chunk_size=2, force=True)
     assert be2.calls == 0 and st2["cache_hits"] == 3 and st2["changed"] == st["changed"]
 
     # dry run: conta senza backend
-    st3 = process_dataset_llm("final", data, out, None, "mock-model", dry_run=True)
+    st3 = process_dataset_llm("big_five", data, out, None, "mock-model", dry_run=True)
     assert st3["unique_candidates"] == 3
 
     # pilota con limite: scrive in llm_pilot e non tocca llm
-    st4 = process_dataset_llm("final", data, out, MockBackend(_mock_fn), "other-model", limit=1)
-    assert (out / "llm_pilot" / "comments_final.csv").exists() and st4["llm_calls"] == 1
+    st4 = process_dataset_llm("big_five", data, out, MockBackend(_mock_fn), "other-model", limit=1)
+    assert (out / "llm_pilot" / "comments_big_five.csv").exists() and st4["llm_calls"] == 1
 
 
 def test_openai_backend_with_fake_server():

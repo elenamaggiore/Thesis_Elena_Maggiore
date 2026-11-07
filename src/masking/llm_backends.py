@@ -3,8 +3,8 @@
 Tutti espongono  generate(batch_messages) -> list[str | None]  (None = chiamata fallita).
 
 - OpenAICompatBackend: qualsiasi server con API /v1/chat/completions
-  (Ollama, LM Studio, vLLM, ...). Consigliato per il PC: i commenti restano in locale.
-- HFBackend: modello Hugging Face caricato in locale (per Colab con GPU).
+  (Ollama, LM Studio, vLLM, ...).
+- HFBackend: modello Hugging Face caricato in locale.
 - MockBackend: per i test, senza modello.
 """
 from __future__ import annotations

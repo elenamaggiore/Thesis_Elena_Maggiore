@@ -7,7 +7,7 @@ Differenze rispetto a pipeline.py (regex):
     interrompe, rilanciando il comando si riparte da dove era arrivato;
   - le righe tenute sono ESATTAMENTE le stesse degli altri livelli (stessa pulizia),
     quindi i file sono confrontabili riga per riga.
-Output: <out_dir>/<livello>/comments_<dataset>.csv   (livello = "llm" oppure "llm_hybrid")
+Output: <out_dir>/<livello>/comments_<dataset>.csv
 """
 from __future__ import annotations
 

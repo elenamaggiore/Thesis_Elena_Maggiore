@@ -4,7 +4,7 @@ Riceve un commento e restituisce solo una lista di span (sottostringhe) da
 mascherare. Sono il codice di questo modulo a validarli e ad applicarli:
   - lo span deve essere una sottostringa ESATTA del commento;
   - gli span troppo lunghi, troppo corti o banali vengono scartati;
-  - la sostituzione usa i segnaposto gia' presenti nel progetto.
+  - la sostituzione usa i placeholders gia' presenti nel progetto.
 In questo modo l'LLM non puo' alterare il resto del testo, e un eventuale
 "prompt injection" dentro un commento Reddit puo' al massimo produrre span
 sbagliati, che i controlli scartano.
