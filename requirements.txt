@@ -1,8 +1,9 @@
 pandas
 numpy
 scikit-learn
-gensim
 imbalanced-learn
+gensim
+nltk
 transformers
 torch
 pyyaml
