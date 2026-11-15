@@ -1,4 +1,10 @@
 """Fase 1: un documento per autore (con i target binari) dai commenti MASCHERATI.
+
+Esempio:
+  python scripts/build_documents.py \
+      --masked-dir "C:\\...\\Datasets_masked" --profiles "C:\\...\\Datasets\\author_profiles.csv" \
+      --out-dir "C:\\...\\Documents" --datasets mbti big_five
+
 Per default elabora i QUATTRO livelli di masking (none, limited, full, llm): ognuno e' un
 dataset di partenza diverso per l'oversampling.
 Output: <out-dir>/documents_<livello>_<dataset>.jsonl.gz
@@ -20,7 +26,8 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--levels", nargs="+", default=["none", "limited", "full", "llm"],
                     help="cartelle di masking da usare (default: none limited full llm)")
-    ap.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=list(DATASETS))
+    ap.add_argument("--datasets", nargs="+", default=["mbti", "big_five"], choices=["mbti", "big_five"],
+                    help="dataset di training su cui si fa l'oversampling")
     ap.add_argument("--max-comments", type=int, default=200, help="tetto di commenti per autore")
     ap.add_argument("--bigfive-cutoff", type=float, default=50.0)
     ap.add_argument("--seed", type=int, default=42)

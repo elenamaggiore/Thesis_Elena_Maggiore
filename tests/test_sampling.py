@@ -44,27 +44,37 @@ def test_targets_and_documents(tmp_path):
     pd.DataFrame({"author": ["a", "b"], "mbti": ["intj", "esfp"], "openness": ["80", "20"],
                   "conscientiousness": ["10", "90"], "extraversion": ["50", "51"],
                   "agreeableness": ["50", "49"], "neuroticism": ["0", "100"]}).to_csv(profiles, index=False)
-    labels = load_author_types(profiles, "final")
     rows = [("a", f"comment number {i} from user a", "x") for i in range(30)] + \
            [("b", f"comment number {i} from user b", "x") for i in range(3)] + \
            [("zzz", "someone without labels at all", "x")]
-    csv = tmp_path / "comments_final.csv"
-    pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(csv, index=False)
-    docs = build_documents(csv, labels, "final", max_comments=10, seed=1)
+    csv_m, csv_b = tmp_path / "comments_mbti.csv", tmp_path / "comments_big_five.csv"
+    for c in (csv_m, csv_b):
+        pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(c, index=False)
+
+    # --- dataset MBTI: solo i 4 target MBTI
+    docs = build_documents(csv_m, load_author_types(profiles, "mbti"), "mbti", max_comments=10, seed=1)
     assert list(docs.author) == ["a", "b"]                       # "zzz" senza etichette escluso
     a = docs[docs.author == "a"].iloc[0]
     assert len(a.comments) == 10 and a.n_comments_seen == 30      # tetto rispettato
     assert (a.introverted, a.intuitive, a.thinking, a.perceiving) == (1, 1, 1, 0)   # INTJ
     b = docs[docs.author == "b"].iloc[0]
     assert (b.introverted, b.intuitive, b.thinking, b.perceiving) == (0, 0, 0, 1)   # ESFP
-    assert (a.openness, b.openness) == (1, 0)                     # >50
-    assert docs.set_index("author").loc["a", "extraversion"] == 0 and docs.set_index("author").loc["b", "extraversion"] == 1
+    assert "openness" not in docs.columns
     save_documents(docs, tmp_path / "d.jsonl.gz")
     back = load_documents(tmp_path / "d.jsonl.gz")
     assert isinstance(back.comments[0], list) and len(back) == 2
-    # riproducibile
-    again = build_documents(csv, labels, "final", max_comments=10, seed=1)
-    assert list(again.comments[0]) == list(docs.comments[0])
+    again = build_documents(csv_m, load_author_types(profiles, "mbti"), "mbti", max_comments=10, seed=1)
+    assert list(again.comments[0]) == list(docs.comments[0])      # riproducibile
+
+    # --- dataset Big Five: solo i 5 target Big Five (cutoff: > 50)
+    bf = build_documents(csv_b, load_author_types(profiles, "big_five"), "big_five", max_comments=10, seed=1)
+    by = bf.set_index("author")
+    assert "introverted" not in bf.columns
+    assert (by.loc["a", "openness"], by.loc["b", "openness"]) == (1, 0)
+    assert (by.loc["a", "extraversion"], by.loc["b", "extraversion"]) == (0, 1)       # 50 non e' > 50
+    assert (by.loc["a", "agreeableness"], by.loc["b", "agreeableness"]) == (0, 0)
+    assert (by.loc["a", "neuroticism"], by.loc["b", "neuroticism"]) == (0, 1)
+    assert by.loc["b", "neuroticism_score"] == 100.0                                   # punteggio grezzo conservato
 
 
 def test_preprocessing():
@@ -174,14 +184,21 @@ def test_cache_only_reader_needs_same_signature(tmp_path):
     syn = augment_minority(docs, "introverted", g, cache=c, max_chunks=2)
     c.close()
     reader = CacheOnlyGenerator(make_signature("gpt2", seed=42))
-    syn2 = augment_minority(docs, "introverted", reader, cache=SyntheticCache(db), max_chunks=2)
-    assert list(syn2.text) == list(syn.text)                          # letto dalla cache, senza generare
-    wrong = CacheOnlyGenerator(make_signature("gpt2", seed=7))
+    c2 = SyntheticCache(db)
     try:
-        augment_minority(docs, "introverted", wrong, cache=SyntheticCache(db), max_chunks=2)
+        syn2 = augment_minority(docs, "introverted", reader, cache=c2, max_chunks=2)
+        assert list(syn2.text) == list(syn.text)                      # letto dalla cache, senza generare
+    finally:
+        c2.close()
+    wrong = CacheOnlyGenerator(make_signature("gpt2", seed=7))
+    c3 = SyntheticCache(db)
+    try:
+        augment_minority(docs, "introverted", wrong, cache=c3, max_chunks=2)
         assert False
     except RuntimeError as e:
         assert "generate_synthetic" in str(e)
+    finally:
+        c3.close()                                                    # su Windows un file aperto non si cancella
 
 
 def test_gpt2_input_follows_strategy_preprocessing():
@@ -209,12 +226,42 @@ def test_gpt2_input_follows_strategy_preprocessing():
     assert prepare_target(docs, "introverted", "no_oversampling", features=False).report["gpt2_input"] is None
 
 
+def test_cache_is_saved_incrementally(tmp_path):
+    docs = make_docs()
+    db = tmp_path / "c.sqlite"
+    state = {"n": 0}
+
+    def flaky(t):
+        state["n"] += 1
+        if state["n"] > 7:                                    # "disconnessione" al 7o blocco
+            raise KeyboardInterrupt
+        return "gen " + t
+
+    g = MockGenerator(flaky)
+    g.signature = "mock"
+    c = SyntheticCache(db)
+    try:
+        try:
+            augment_minority(docs, "introverted", g, cache=c, max_chunks=1, docs_per_batch=5)
+            assert False
+        except KeyboardInterrupt:
+            pass
+        saved = c.db.execute("SELECT COUNT(*) FROM syn").fetchone()[0]
+        assert saved == 5                                      # il primo gruppo (5 documenti) e' gia' in cache
+        g2 = MockGenerator(lambda t: "gen " + t)
+        g2.signature = "mock"
+        syn = augment_minority(docs, "introverted", g2, cache=c, max_chunks=1, docs_per_batch=5)
+        assert len(syn) == 12 and g2.calls == 12 - saved        # riparte dal punto in cui si era fermato
+    finally:
+        c.close()
+
+
 if __name__ == "__main__":
     import tempfile
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             if "tmp_path" in fn.__code__.co_varnames[:fn.__code__.co_argcount]:
-                with tempfile.TemporaryDirectory() as d:
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
                     fn(Path(d))
             else:
                 fn()

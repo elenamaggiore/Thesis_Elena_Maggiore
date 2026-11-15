@@ -1,6 +1,26 @@
 """Augmentation testuale con GPT-2 (Patel & Dhavale, sez. 3.5-3.6).
 
+Procedura del paper: il documento di un utente e' diviso nei suoi commenti (separati da
+"|||"), i commenti sono raggruppati a blocchi di 5, per ogni blocco GPT-2 (pre-addestrato,
+NON fine-tuned) genera un testo, l'output e' ripulito (contrazioni espanse, artefatti del
+forum rimossi, spazi normalizzati) e i blocchi generati sono riuniti in un NUOVO documento
+"sintetico" con le stesse etichette dell'utente di partenza.
 
+Parametri di generazione = Tabella 5: contesto 150 token, beam 5 (con campionamento),
+no_repeat_ngram 2, temperature 0.7, top-k 50, top-p 0.95.
+
+Scelte mie dove il paper non dice (modificabili):
+  - quanti sintetici: `multiplier` documenti per ogni utente della classe minoritaria
+    (1.0 = la minoranza raddoppia, senza superare la maggioranza); il paper non lo dichiara,
+    e il resto del bilanciamento lo fa SMOTE;
+  - lunghezza: max_length totale = max(200, token_input + 50), massimo 1024 (limite GPT-2);
+  - il blocco in ingresso a GPT-2 e' il testo GIA' PREPROCESSATO con lo stesso preprocessing
+    della strategia (come nel testo del paper e nell'"Esperimento 1" del report: prima la
+    pulizia, poi la generazione); input_kind="raw" usa invece il testo mascherato non pulito
+    (come l'esempio di Tabella 6). L'output e' poi preprocessato di nuovo nella fase feature;
+  - `max_chunks` limita i blocchi per documento (costo): con 200 commenti per utente
+    sarebbero 40 generazioni a documento.
+GPT-2 e' costoso: genera una volta (scripts/generate_synthetic.py) e riusa la cache SQLite.
 """
 from __future__ import annotations
 
@@ -170,13 +190,16 @@ def plan_synthetic(y, multiplier: float = 1.0, seed: int = 42):
 def augment_minority(docs: pd.DataFrame, target: str, generator, *, multiplier: float = 1.0,
                      chunk_size: int = 5, max_chunks: int | None = 8,
                      cache: SyntheticCache | None = None, seed: int = 42,
-                     input_fn=None, input_tag: str = "raw") -> pd.DataFrame:
+                     input_fn=None, input_tag: str = "raw",
+                     docs_per_batch: int = 64) -> pd.DataFrame:
     """Documenti SINTETICI per la classe minoritaria di `target` (da aggiungere a `docs`).
 
     Le righe sintetiche copiano TUTTE le etichette dell'autore di partenza e hanno
     author = "<autore>#syn<copia>", source_author = autore di partenza, is_synthetic = True.
     input_fn / input_tag: come trasformare ogni commento prima di darlo a GPT-2 (vedi
     make_input_fn); l'etichetta fa parte della chiave di cache.
+    La cache e' scritta ogni `docs_per_batch` documenti: se il processo si interrompe
+    (es. disconnessione di Colab) si perde al massimo l'ultimo gruppo.
     Se `generator` e' None, usa solo la cache e dà errore se manca qualcosa.
     """
     docs = docs.reset_index(drop=True)
@@ -201,26 +224,29 @@ def augment_minority(docs: pd.DataFrame, target: str, generator, *, multiplier: 
         if generator is None:
             raise RuntimeError(f"{len(todo)} sintetici mancanti in cache e nessun generatore: "
                                f"lancia prima scripts/generate_synthetic.py")
-        flat, owner = [], []
-        for pos, c in todo:
-            src = list(docs.iloc[pos]["comments"])
-            if input_fn is not None:
-                src = [input_fn(c) for c in src]
-            for ch in make_chunks(src, chunk_size, max_chunks):
-                flat.append(ch)
-                owner.append((pos, c))
-        outs = generator.generate(flat) if flat else []
-        per_doc: dict[tuple, list[str]] = {}
-        for own, out in zip(owner, outs):
-            t = postprocess_generated(out)
-            if t:
-                per_doc.setdefault(own, []).append(t)
-        new = {}
-        for own in todo:
-            text = SEP.join(per_doc.get(own, []))
-            found[own] = text
-            new[keys[own]] = text
-        cache.put_many(new)
+        for start in range(0, len(todo), docs_per_batch):
+            group = todo[start:start + docs_per_batch]
+            flat, owner = [], []
+            for pos, c in group:
+                src = list(docs.iloc[pos]["comments"])
+                if input_fn is not None:
+                    src = [input_fn(x) for x in src]
+                for ch in make_chunks(src, chunk_size, max_chunks):
+                    flat.append(ch)
+                    owner.append((pos, c))
+            outs = generator.generate(flat) if flat else []
+            per_doc: dict[tuple, list[str]] = {}
+            for own, out in zip(owner, outs):
+                t = postprocess_generated(out)
+                if t:
+                    per_doc.setdefault(own, []).append(t)
+            new = {}
+            for own in group:
+                text = SEP.join(per_doc.get(own, []))
+                found[own] = text
+                new[keys[own]] = text
+            cache.put_many(new)                       # salvataggio incrementale
+            print(f"  documenti sintetici: {min(start + docs_per_batch, len(todo))}/{len(todo)}", flush=True)
 
     rows = []
     for pos, c in picks:
