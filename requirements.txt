@@ -2,9 +2,10 @@ pandas
 numpy
 scikit-learn
 imbalanced-learn
-gensim
+gensim>=4.3.3
 nltk
 transformers
 torch
 pyyaml
 matplotlib
+scipy

@@ -14,7 +14,7 @@ import pandas as pd
 
 from .targets import add_targets
 
-COMMENT_SEP = " ||| "   # separatore tra commenti nel campo "text"
+COMMENT_SEP = " ||| "   # separatore tra commenti nel campo "text" (come nel dataset Kaggle MBTI)
 
 
 def build_user_documents(comments_csv: Path, authors: set[str], max_comments: int = 200,
@@ -43,7 +43,7 @@ def build_user_documents(comments_csv: Path, authors: set[str], max_comments: in
 
 
 def build_documents(comments_csv: Path, labels: dict[str, dict], dataset: str,
-                    max_comments: int = 200, seed: int = 42, bigfive_cutoff: dict[str, float]={"openness": 50,"conscientiousness": 50,"extraversion": 50,"agreeableness": 50,"neuroticism": 50},
+                    max_comments: int = 200, seed: int = 42, bigfive_cutoff=50.0,
                     chunk_size: int = 200_000) -> pd.DataFrame:
     """Documenti + target binari. Tiene solo gli autori con etichette valide e almeno un commento."""
     docs = build_user_documents(comments_csv, set(labels), max_comments, seed, chunk_size)

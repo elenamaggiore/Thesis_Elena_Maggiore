@@ -256,6 +256,23 @@ def test_cache_is_saved_incrementally(tmp_path):
         c.close()
 
 
+def test_bigfive_cutoff_number_or_dict():
+    from src.data.targets import add_targets, cutoff_map
+    docs = pd.DataFrame({"author": ["a", "b"]})
+    labels = {"a": {t: 60.0 for t in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")},
+              "b": {t: 40.0 for t in ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")}}
+    one = add_targets(docs, labels, "big_five", 50.0)                         # un numero per tutti i tratti
+    assert one.openness.tolist() == [1, 0] and one.neuroticism.tolist() == [1, 0]
+    per_trait = {"openness": 70, "conscientiousness": 30, "extraversion": 50, "agreeableness": 50, "neuroticism": 50}
+    two = add_targets(docs, labels, "big_five", per_trait)                    # un dizionario: cutoff per tratto
+    assert two.openness.tolist() == [0, 0] and two.conscientiousness.tolist() == [1, 1]
+    try:
+        cutoff_map({"openness": 50})
+        assert False
+    except ValueError as e:
+        assert "conscientiousness" in str(e)
+
+
 if __name__ == "__main__":
     import tempfile
     for name, fn in list(globals().items()):

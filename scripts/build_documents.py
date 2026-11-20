@@ -10,6 +10,7 @@ dataset di partenza diverso per l'oversampling.
 Output: <out-dir>/documents_<livello>_<dataset>.jsonl.gz
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,14 +27,21 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--levels", nargs="+", default=["none", "limited", "full", "llm"],
                     help="cartelle di masking da usare (default: none limited full llm)")
-    ap.add_argument("--datasets", nargs="+", default=["mbti", "big_five"], choices=["mbti", "big_five"],
-                    help="dataset di training su cui si fa l'oversampling")
+    ap.add_argument("--datasets", nargs="+", default=["mbti", "big_five", "final"],
+                    choices=["mbti", "big_five", "final"],
+                    help="mbti e big_five = training (oversampling); final = SOLO test, mai aumentato")
     ap.add_argument("--max-comments", type=int, default=200, help="tetto di commenti per autore")
-    ap.add_argument("--bigfive-cutoff", type=float, default=50.0)
+    ap.add_argument("--bigfive-cutoff", type=float, default=50.0,
+                    help="cutoff unico per tutti i tratti Big Five")
+    ap.add_argument("--bigfive-cutoffs-json", default=None,
+                    help="JSON {tratto: cutoff} per usare un cutoff diverso per tratto (ha la precedenza)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
+    cutoff = args.bigfive_cutoff
+    if args.bigfive_cutoffs_json:
+        cutoff = json.loads(Path(args.bigfive_cutoffs_json).read_text(encoding="utf-8"))
     for level in args.levels:
         for name in args.datasets:
             out = Path(args.out_dir) / f"documents_{level}_{name}.jsonl.gz"
@@ -45,7 +53,7 @@ def main():
                 print(f"[{level}/{name}] file non trovato: {src}")
                 continue
             labels = load_author_types(Path(args.profiles), name)
-            docs = build_documents(src, labels, name, args.max_comments, args.seed, args.bigfive_cutoff)
+            docs = build_documents(src, labels, name, args.max_comments, args.seed, cutoff)
             save_documents(docs, out)
             print(f"[{level}/{name}] {len(docs):,} documenti (su {len(labels):,} autori con etichette) -> {out}")
 
