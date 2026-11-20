@@ -153,11 +153,13 @@ def mask_none(text: str) -> str:
 
 
 def mask_limited(text: str, own_type: str | None, rules: tuple[str, ...]) -> str:
-    """rules: sottoinsieme di ("mbti", "bigfive"), dipende dalle etichette del dataset."""
+    """rules: sottoinsieme di ("mbti", "bigfive","final"), dipende dalle etichette del dataset."""
     if "mbti" in rules and own_type:
         text = _own_type_re(own_type).sub(PH_TYPE, text)
     if "bigfive" in rules:
         text = mask_bigfive_scores(text)
+    if "final" in rules:
+        text=text
     return text
 
 

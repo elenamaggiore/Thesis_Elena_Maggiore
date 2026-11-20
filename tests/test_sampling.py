@@ -51,11 +51,11 @@ def test_targets_and_documents(tmp_path):
     for c in (csv_m, csv_b):
         pd.DataFrame(rows, columns=["author", "body", "subreddit"]).to_csv(c, index=False)
 
-    # --- dataset MBTI: solo i 4 target MBTI
+
     docs = build_documents(csv_m, load_author_types(profiles, "mbti"), "mbti", max_comments=10, seed=1)
-    assert list(docs.author) == ["a", "b"]                       # "zzz" senza etichette escluso
+    assert list(docs.author) == ["a", "b"]                       
     a = docs[docs.author == "a"].iloc[0]
-    assert len(a.comments) == 10 and a.n_comments_seen == 30      # tetto rispettato
+    assert len(a.comments) == 10 and a.n_comments_seen == 30
     assert (a.introverted, a.intuitive, a.thinking, a.perceiving) == (1, 1, 1, 0)   # INTJ
     b = docs[docs.author == "b"].iloc[0]
     assert (b.introverted, b.intuitive, b.thinking, b.perceiving) == (0, 0, 0, 1)   # ESFP
@@ -66,15 +66,14 @@ def test_targets_and_documents(tmp_path):
     again = build_documents(csv_m, load_author_types(profiles, "mbti"), "mbti", max_comments=10, seed=1)
     assert list(again.comments[0]) == list(docs.comments[0])      # riproducibile
 
-    # --- dataset Big Five: solo i 5 target Big Five (cutoff: > 50)
     bf = build_documents(csv_b, load_author_types(profiles, "big_five"), "big_five", max_comments=10, seed=1)
     by = bf.set_index("author")
     assert "introverted" not in bf.columns
     assert (by.loc["a", "openness"], by.loc["b", "openness"]) == (1, 0)
-    assert (by.loc["a", "extraversion"], by.loc["b", "extraversion"]) == (0, 1)       # 50 non e' > 50
+    assert (by.loc["a", "extraversion"], by.loc["b", "extraversion"]) == (0, 1)       
     assert (by.loc["a", "agreeableness"], by.loc["b", "agreeableness"]) == (0, 0)
     assert (by.loc["a", "neuroticism"], by.loc["b", "neuroticism"]) == (0, 1)
-    assert by.loc["b", "neuroticism_score"] == 100.0                                   # punteggio grezzo conservato
+    assert by.loc["b", "neuroticism_score"] == 100.0                                   
 
 
 def test_preprocessing():
@@ -83,8 +82,8 @@ def test_preprocessing():
     assert preprocess_minimal("Hello, World! It's 5 TYPE_MENTION") == ["hello", "world", "it's", "5", "type_mention"]
     full = get_preprocessor("full")
     toks = full("I don't like ENTPs. TYPE_MENTION is the best, running dogs! http://x.com @bob")
-    assert "i" in toks and "like" in toks and "dog" in toks         # lemma: dogs -> dog
-    assert "typemention" in toks                                    # segnaposto protetto
+    assert "i" in toks and "like" in toks and "dog" in toks 
+    assert "typemention" in toks 
     assert "entps" not in toks and "bob" not in toks and "the" not in toks and "x" not in toks
 
 
@@ -97,7 +96,6 @@ def test_split_and_undersample_and_smote():
     X = np.random.default_rng(0).normal(size=(50, 4))
     Xr, yr, info = oversample_vectors(X, y)
     assert info["method_used"] == "smote" and np.bincount(yr).tolist() == [40, 40]
-    # pochi esempi: k ridotto o fallback a random, senza errori
     Xr, yr, info = oversample_vectors(X[:42], [1] * 2 + [0] * 40)
     assert np.bincount(yr).tolist() == [40, 40] and info["k_neighbors"] == 1
     Xr, yr, info = oversample_vectors(X[:41], [1] * 1 + [0] * 40)
@@ -106,9 +104,9 @@ def test_split_and_undersample_and_smote():
 
 def test_plan_and_augment_with_cache():
     docs = make_docs()
-    assert len(plan_synthetic(docs.introverted, 1.0)) == 12                 # raddoppia la minoranza
-    assert len(plan_synthetic(docs.introverted, 10.0)) == 36                # tetto: n_maj - n_min
-    assert plan_synthetic([1] * 5 + [0] * 5) == []                          # gia' bilanciato
+    assert len(plan_synthetic(docs.introverted, 1.0)) == 12                
+    assert len(plan_synthetic(docs.introverted, 10.0)) == 36               
+    assert plan_synthetic([1] * 5 + [0] * 5) == []                        
     g, cache = mock_gen(), SyntheticCache()
     syn = augment_minority(docs, "introverted", g, cache=cache, max_chunks=2)
     assert len(syn) == 12 and syn.is_synthetic.all() and (syn.introverted == 1).all()

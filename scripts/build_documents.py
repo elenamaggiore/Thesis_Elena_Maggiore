@@ -1,14 +1,16 @@
-"""Fase 1: un documento per autore (con i target binari) dai commenti MASCHERATI.
-
-Esempio:
-  python scripts/build_documents.py \
-      --masked-dir "C:\\...\\Datasets_masked" --profiles "C:\\...\\Datasets\\author_profiles.csv" \
-      --out-dir "C:\\...\\Documents" --datasets mbti big_five
-
-Per default elabora i QUATTRO livelli di masking (none, limited, full, llm): ognuno e' un
-dataset di partenza diverso per l'oversampling.
-Output: <out-dir>/documents_<livello>_<dataset>.jsonl.gz
 """
+Phase 1: build one document per author (with binary targets)
+from masked comments.
+
+MBTI and Big Five have a separate dataset for each masking level.
+The Final Dataset is processed only once from the original,
+unmasked dataset.
+
+Output:
+  <out-dir>/<level>/documents_<dataset>.jsonl.gz
+  <out-dir>/final/documents_final.jsonl.gz
+"""
+
 import argparse
 import json
 import sys
@@ -21,41 +23,89 @@ from src.masking.pipeline import DATASETS, load_author_types  # noqa: E402
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--masked-dir", required=True, help="cartella con le sottocartelle full/, limited/, ...")
-    ap.add_argument("--profiles", required=True, help="author_profiles.csv")
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--masked-dir", required=True)
+    ap.add_argument("--final-dir", required=True)
+    ap.add_argument("--profiles", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--levels", nargs="+", default=["none", "limited", "full", "llm"],
-                    help="cartelle di masking da usare (default: none limited full llm)")
+
+    ap.add_argument("--levels", nargs="+", default=["none", "limited", "full", "llm"])
     ap.add_argument("--datasets", nargs="+", default=["mbti", "big_five", "final"],
-                    choices=["mbti", "big_five", "final"],
-                    help="mbti e big_five = training (oversampling); final = SOLO test, mai aumentato")
-    ap.add_argument("--max-comments", type=int, default=200, help="tetto di commenti per autore")
-    ap.add_argument("--bigfive-cutoff", type=float, default=50.0,
-                    help="cutoff unico per tutti i tratti Big Five")
-    ap.add_argument("--bigfive-cutoffs-json", default=None,
-                    help="JSON {tratto: cutoff} per usare un cutoff diverso per tratto (ha la precedenza)")
+                    choices=["mbti", "big_five", "final"])
+
+    ap.add_argument("--max-comments", type=int, default=200)
+    ap.add_argument("--bigfive-cutoff", type=float, default=50.0)
+    ap.add_argument("--bigfive-cutoffs-json", default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true")
+
     args = ap.parse_args()
 
     cutoff = args.bigfive_cutoff
     if args.bigfive_cutoffs_json:
-        cutoff = json.loads(Path(args.bigfive_cutoffs_json).read_text(encoding="utf-8"))
+        cutoff = json.loads(
+            Path(args.bigfive_cutoffs_json).read_text(encoding="utf-8")
+        )
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    profiles = Path(args.profiles)
+
+    training_datasets = [
+        name for name in args.datasets
+        if name in ("mbti", "big_five")
+    ]
+
     for level in args.levels:
-        for name in args.datasets:
-            out = Path(args.out_dir) / f"documents_{level}_{name}.jsonl.gz"
+        level_dir = out_dir / level
+        level_dir.mkdir(parents=True, exist_ok=True)
+
+        for name in training_datasets:
+            out = level_dir / f"documents_{name}.jsonl.gz"
+
             if out.exists() and not args.force:
-                print(f"[{level}/{name}] gia' presente: {out} (usa --force per rifarlo)")
+                print(f"[{level}/{name}] already exists: {out}")
                 continue
+
             src = Path(args.masked_dir) / level / DATASETS[name]["file"]
+
             if not src.exists():
-                print(f"[{level}/{name}] file non trovato: {src}")
+                print(f"[{level}/{name}] file not found: {src}")
                 continue
-            labels = load_author_types(Path(args.profiles), name)
-            docs = build_documents(src, labels, name, args.max_comments, args.seed, cutoff)
+
+            labels = load_author_types(profiles, name)
+
+            docs = build_documents(
+                src, labels, name, args.max_comments, args.seed, cutoff
+            )
             save_documents(docs, out)
-            print(f"[{level}/{name}] {len(docs):,} documenti (su {len(labels):,} autori con etichette) -> {out}")
+
+            print(f"[{level}/{name}] {len(docs):,} documents -> {out}")
+
+    if "final" in args.datasets:
+        final_dir = out_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+
+        out = final_dir / "documents_final.jsonl.gz"
+
+        if out.exists() and not args.force:
+            print(f"[final] already exists: {out}")
+        else:
+            src = Path(args.final_dir) / DATASETS["final"]["file"]
+
+            if not src.exists():
+                print(f"[final] file not found: {src}")
+            else:
+                labels = load_author_types(profiles, "final")
+
+                docs = build_documents(
+                    src, labels, "final", args.max_comments, args.seed, cutoff
+                )
+                save_documents(docs, out)
+
+                print(f"[final] {len(docs):,} documents -> {out}")
 
 
 if __name__ == "__main__":

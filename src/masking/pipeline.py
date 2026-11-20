@@ -23,6 +23,7 @@ from .rules import DROP_SUBREDDIT_LEVELS, mask_text, normalize_subreddit
 DATASETS = {
     "mbti": {"file": "comments_mbti.csv", "rules": ("mbti",)},
     "big_five": {"file": "comments_big_five.csv", "rules": ("bigfive",)},
+    "final": {"file": "comments_final.csv","rules":("mbti", "bigfive",)}
 }
 
 # Colonne dei punteggi Big Five in author_profiles.csv

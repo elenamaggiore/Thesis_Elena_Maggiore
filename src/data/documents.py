@@ -1,4 +1,6 @@
-"""Un DOCUMENTO per autore, a partire dai file di commenti (gia' mascherati).
+"""
+Builds documents
+Un DOCUMENTO per autore, a partire dai file di commenti (gia' mascherati).
 
 Gli autori PANDORA hanno migliaia di commenti: ne teniamo al massimo `max_comments`
 per autore, scelti a caso (reservoir sampling con seed fisso, quindi riproducibile
@@ -14,7 +16,7 @@ import pandas as pd
 
 from .targets import add_targets
 
-COMMENT_SEP = " ||| "   # separatore tra commenti nel campo "text" (come nel dataset Kaggle MBTI)
+COMMENT_SEP = " ||| "
 
 
 def build_user_documents(comments_csv: Path, authors: set[str], max_comments: int = 200,

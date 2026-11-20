@@ -1,9 +1,7 @@
-"""Chunk di testo (fino a 512 token) con l'etichetta dell'AUTORE, e pool per autore.
-
-Un documento (i commenti di un autore) e' diviso in chunk impacchettando commenti consecutivi
-fino a max_tokens (510 = 512 meno <s> e </s>). Un commento piu' lungo diventa un chunk da solo
-(il tokenizer lo tronca). In training, a ogni epoca si ricampionano al piu' k chunk per autore
-dal pool, SENZA reinserimento: nessun autore domina, qualunque sia il suo numero di commenti.
+"""
+Chunks comments for RoBERTa (max 512 tokens). Chunks are labelled with author's label.
+Comments of more than 512 are cut short by the tokeniser.
+During training, chunks are resampled by author between epochs. 
 """
 from __future__ import annotations
 
@@ -30,7 +28,6 @@ def build_chunks(comments: list[str], counts: list[int], max_tokens: int = 510, 
 
 
 def evenly_spaced(n: int, cap: int | None) -> list[int]:
-    """Al piu' `cap` indici distribuiti su tutto l'intervallo (deterministico)."""
     if cap is None or n <= cap:
         return list(range(n))
     return sorted(set(np.linspace(0, n - 1, cap).round().astype(int).tolist()))
@@ -49,7 +46,6 @@ class ChunkPool:
         return sum(min(k, len(c)) for c in self.chunks)
 
     def sample_epoch(self, rng: np.random.Generator, k: int) -> list[tuple[str, np.ndarray]]:
-        """Al piu' k chunk per autore, senza reinserimento; ordine mescolato."""
         items = []
         for i, pool in enumerate(self.chunks):
             take = len(pool) if len(pool) <= k else k
@@ -59,7 +55,6 @@ class ChunkPool:
         return [items[j] for j in order]
 
     def eval_items(self) -> tuple[list[str], np.ndarray]:
-        """Tutti i chunk del pool, con l'indice dell'autore di ciascuno."""
         texts, owner = [], []
         for i, pool in enumerate(self.chunks):
             texts += pool
@@ -69,7 +64,6 @@ class ChunkPool:
 
 def build_pool(frame: pd.DataFrame, targets, count_fn, max_tokens: int = 510,
                cap: int | None = None, require_labels: bool = True) -> ChunkPool:
-    """frame: documenti con colonne author, comments (lista) e target. cap: tetto di chunk per autore."""
     authors, chunks, labels = [], [], []
     for _, row in frame.iterrows():
         comments = [str(c) for c in row["comments"]]

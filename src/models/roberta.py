@@ -1,17 +1,20 @@
-"""RoBERTa multi-task (Shum et al.) con addestramento a livello di CHUNK e validazione per UTENTE.
+""" RoBERTa MultiTask encoder (inspired by Shum et al.)
 
-Modello     encoder pre-addestrato (roberta-base | roberta-large | bert-base-* | bert-large-*)
-            -> mean pooling sui token del chunk (maschera di attenzione) -> dropout 0.3
-            -> UN layer lineare con tanti output quanti i target: 5 (Big Five) o 4 (MBTI).
-            Classificazione binaria multi-label: loss = BCE con pos_weight per task.
-Training    chunk fino a 512 token con l'etichetta dell'autore; a ogni epoca si ricampionano
-            al piu' `chunks_per_author` chunk per autore dal pool (nessun autore domina).
-Validazione a livello UTENTE: media delle probabilita' dei chunk dell'autore (model averaging
-            di Christian et al., applicato ai chunk). Epoca migliore = AUC medio sui task.
-Ottimizzatore AdamW con lr piu' basso sull'encoder (1e-5, come Shum) e piu' alto sulla testa,
-            weight decay 0.01 (non su bias e LayerNorm), gradient clipping 1.0, scheduler con
-            warmup del 6% e decadimento lineare, batch 16, 10 epoche, early stopping a 2.
-Preprocessing minimo: il testo arriva com'e' (lemmi/stopword rovinano l'input sub-word).
+Uses a pre-trained encoder, options: default roberta-large, roberta-base, bert-base-*, bert-large-*
+Attention mask: mean pooling on a single chunk with 0.3 dropout
+One layer with 5 outputs (Big Five) or 4 outputs (MBTI)
+Binary Cross Entropy with pos_weight is used as the loss function
+
+Model is trained on chunks (max. 512 tokens) with the author's label. Each epoch resamples at most
+<<chunks_per_author>> chunks for each author.
+
+Validation is performed on users, through Model Averaging on chunks. Best epoch is selected through
+average AUC on all tasks.
+
+AdamW is used as optimiser, learning rate is set 1e-5 on the encoder and 1e-3 on the head, weight
+decay 0.01, gradient clipping 1.0, scheduler warmup at 6% with linear decay-
+It is run in batches of 16, for 10 epochs (early stopping 2)
+
 """
 from __future__ import annotations
 
@@ -30,10 +33,10 @@ from ..eval.metrics import auc_score, binary_metrics
 from .chunks import ChunkPool, build_pool
 
 DEFAULTS = dict(
-    encoder="roberta-base",          # anche: roberta-large (il migliore in Shum), bert-base-uncased, bert-large-uncased
+    encoder="roberta-large",          # options are roberta-large, roberta-base, bert-base-uncased, bert-large-uncased
     dropout=0.3,
-    lr_encoder=1e-5,                 # Shum: 1e-5 dopo ricerca dell'iperparametro
-    lr_head=1e-3,                    # testa piu' alta: parte da zero, l'encoder e' gia' addestrato
+    lr_encoder=1e-5,                 
+    lr_head=1e-3,
     weight_decay=0.01,
     clip=1.0,
     warmup=0.06,
@@ -41,14 +44,14 @@ DEFAULTS = dict(
     epochs=10,
     patience=2,
     max_len=512,
-    chunks_per_author=4,             # chunk campionati per autore a ogni epoca
-    max_pool_chunks=32,              # tetto del pool di chunk per autore (memoria)
-    max_eval_chunks=16,              # chunk per autore in validazione/test
+    chunks_per_author=4,
+    max_pool_chunks=32,
+    max_eval_chunks=16,
     pos_weight_min=0.5,
     pos_weight_max=3.0,
-    amp=True,                        # precisione mista, solo su GPU
-    seed=42,                         # seed del modello e del ricampionamento
-    split_seed=42,                   # seed dello split: fisso, uguale per tutti i membri di un ensemble
+    amp=True,                        # GPU only
+    seed=11,
+    split_seed=11,
     val_size=0.2,
 )
 
@@ -58,7 +61,7 @@ class MultiTaskEncoder(nn.Module):
         super().__init__()
         if pretrained:
             self.encoder = AutoModel.from_pretrained(encoder)
-        else:                                      # in valutazione: i pesi arrivano dal checkpoint
+        else:
             self.encoder = AutoModel.from_config(AutoConfig.from_pretrained(encoder))
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(self.encoder.config.hidden_size, n_tasks)
@@ -67,7 +70,7 @@ class MultiTaskEncoder(nn.Module):
         h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         m = attention_mask.unsqueeze(-1).to(h.dtype)
         pooled = (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)      # mean pooling
-        return self.head(self.dropout(pooled))                          # logit, uno per task
+        return self.head(self.dropout(pooled))
 
 
 def set_seed(seed: int):
@@ -111,12 +114,11 @@ def _scaler(enabled: bool):
 
 @torch.no_grad()
 def predict_pool(model, tok, pool: ChunkPool, device, max_len: int, batch_size: int, amp: bool = False) -> np.ndarray:
-    """Probabilita' per AUTORE (n_autori x n_task): media delle probabilita' dei suoi chunk."""
     model.eval()
     texts, owner = pool.eval_items()
     n_tasks = pool.labels.shape[1]
     probs = np.zeros((len(texts), n_tasks), dtype=np.float32)
-    order = np.argsort([len(t) for t in texts])                # chunk simili vicini: meno padding
+    order = np.argsort([len(t) for t in texts])         #reduces padding
     for i in range(0, len(order), batch_size):
         idx = order[i:i + batch_size]
         enc = tok([texts[j] for j in idx], truncation=True, max_length=max_len,
@@ -151,10 +153,11 @@ def val_metrics(Y: np.ndarray, P: np.ndarray, targets) -> dict:
 
 
 def train_run(cfg: dict, data, out_dir, tokenizer=None, log=print) -> dict:
-    """Addestra UN modello sui dati `data` (MultiTaskData) e salva il checkpoint migliore in out_dir.
-
-    cfg: parametri (vedi DEFAULTS) piu' i metadati che finiscono in config.json
-    (level, strategy, dataset, ...). Ritorna il riassunto salvato in done.json.
+    """
+    Trains one model on data.
+    Input config: params (or DEFAULTS), metadata from config.json
+    Summary is saved in done.json
+    Best checkpoint is saved in out_dir
     """
     cfg = {**DEFAULTS, **cfg}
     out_dir = Path(out_dir)
@@ -186,7 +189,7 @@ def train_run(cfg: dict, data, out_dir, tokenizer=None, log=print) -> dict:
     best_epoch = 0
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
-        rng = np.random.default_rng(cfg["seed"] * 1000 + epoch)          # ricampionamento diverso a ogni epoca
+        rng = np.random.default_rng(cfg["seed"] * 11 + epoch)          # resampling is randomised in each epoch
         items = train_pool.sample_epoch(rng, cfg["chunks_per_author"])
         losses, t1 = [], time.time()
         for i in range(0, len(items), cfg["batch_size"]):
@@ -244,8 +247,10 @@ def load_checkpoint(ckpt_dir, device=None):
 
 
 def predict_frame(ckpt_dir, frame, device=None, batch_size: int = 32):
-    """Probabilita' per autore di un checkpoint su un DataFrame di documenti (es. il test `final`).
-    Ritorna (autori, probabilita' n_autori x n_task)."""
+    """
+    Predictions returned for a dataset.
+    Returns author, probabilities for each author and for each task.
+    """
     model, tok, cfg = load_checkpoint(ckpt_dir, device)
     device = next(model.parameters()).device
     targets = cfg["targets"]
