@@ -1,0 +1,609 @@
+#!/usr/bin/env python
+"""
+RoBERTa per-dicotomia (single-task binario) + valutazione combinata sul dataset final.
+
+Struttura attesa di ciascuna root (es. Datasets_synthetic, Datasets_xxx, ...):
+
+    <root>/<strategia>/mbti/<trait>_<suffix>.csv        trait in introverted, intuitive, thinking, perceiving
+    <root>/<strategia>/big_five/<trait>_<suffix>.csv    trait in openness, conscientiousness, extraversion,
+                                                        agreeableness, neuroticism
+    <root>/<strategia>/final*.csv   (oppure <root>/final*.csv, oppure --final-csv)
+
+COMANDI
+  train     addestra un modello per (root, strategia, famiglia, trait, seed) e salva le
+            probabilita' a livello autore sul final in
+            <runs>/<root>/<strategia>/<famiglia>/<trait>/s<seed>/preds_final.csv
+            (un run con preds_final.csv gia' presente viene saltato).
+  evaluate  legge TUTTE le predizioni in <runs>, combina i 4 modelli MBTI e i 5 Big Five per
+            ogni (root, strategia), calcola metriche + bootstrap appaiato 95% e scrive le
+            tabelle di confronto in --out.
+
+ESEMPI (PowerShell)
+  python scripts/train_dichotomies.py train --roots "$D\Datasets_synthetic" "$D\Datasets_altro" --runs "$D\runs" --dry-run
+  python scripts/train_dichotomies.py train --roots "$D\Datasets_synthetic" --runs "$D\runs" --limit-authors 300 --epochs 1 --encoder roberta-base --runs "$D\runs_pilot"
+  python scripts/train_dichotomies.py train --roots "$D\Datasets_synthetic" "$D\Datasets_altro" --runs "$D\runs" --seeds 42 43 44
+  python scripts/train_dichotomies.py evaluate --runs "$D\runs" --out "$D\results"
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import math
+import random
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+
+MBTI_TRAITS = ["introverted", "intuitive", "thinking", "perceiving"]
+B5_TRAITS = ["openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"]
+FAMILIES = {"mbti": MBTI_TRAITS, "big_five": B5_TRAITS}
+
+AUTHOR_C = ["author_id", "author", "user", "username"]
+TEXT_C = ["text", "document", "doc", "comments", "body", "content"]
+SYN_C = ["is_synthetic", "synthetic", "is_generated", "generated"]
+SRC_C = ["source_author", "orig_author", "origin_author", "parent_author", "source_id"]
+METRICS = ["accuracy", "balanced_accuracy", "macro_f1", "f1_positive", "mcc", "auc"]
+
+
+# ============================================================ utilities
+def pick(df, cands, explicit=None, required=True, what=""):
+    if explicit:
+        if explicit not in df.columns:
+            raise KeyError(f"Colonna '{explicit}' non trovata. Colonne: {list(df.columns)}")
+        return explicit
+    for c in cands:
+        if c in df.columns:
+            return c
+    if required:
+        raise KeyError(f"Impossibile individuare la colonna {what}. Candidate: {cands}. "
+                       f"Colonne presenti: {list(df.columns)}. Passala con l'opzione --*-col.")
+    return None
+
+
+def to_bool(s):
+    return s.astype(str).str.strip().str.lower().isin({"1", "1.0", "true", "yes", "y", "t"})
+
+
+def evenly(n, k):
+    if n <= k:
+        return np.arange(n)
+    return np.unique(np.linspace(0, n - 1, k).round().astype(int))
+
+
+def parse_comments(text):
+    if isinstance(text, (list, tuple, np.ndarray)):
+        return [str(c) for c in text]
+    if text is None or (isinstance(text, float) and math.isnan(text)):
+        return []
+    s = str(text).strip()
+    if s.startswith("["):
+        for fn in (json.loads, ast.literal_eval):
+            try:
+                v = fn(s)
+                if isinstance(v, list):
+                    return [str(c) for c in v]
+            except Exception:
+                pass
+    if "|||" in s:
+        return [c for c in s.split("|||")]
+    return [s]
+
+
+def set_seed(seed):
+    import torch
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================ chunking
+def build_chunks(tok, text, a):
+    """Testo di un autore -> lista di chunk (np.int32) <= max_len token, con token speciali.
+    I commenti sono concatenati (separati da sep) e poi tagliati in finestre di max_len-2 token;
+    si tengono al massimo max_pool_chunks chunk equispaziati sullo storico."""
+    comments = parse_comments(text)
+    if len(comments) > a.max_comments:
+        comments = [comments[i] for i in evenly(len(comments), a.max_comments)]
+    comments = [c[: a.max_chars] for c in comments if c and c.strip()]
+    ids = []
+    sep = [tok.sep_token_id] if tok.sep_token_id is not None else []
+    if comments:
+        enc = tok(comments, add_special_tokens=False, truncation=False)["input_ids"]
+        for e in enc:
+            ids.extend(e)
+            ids.extend(sep)
+    body = a.max_len - 2
+    wins = [ids[i:i + body] for i in range(0, len(ids), body)]
+    if len(wins) > 1 and len(wins[-1]) < 16:
+        wins.pop()
+    if not wins:
+        wins = [[]]
+    sel = evenly(len(wins), a.max_pool_chunks)
+    return [np.array(tok.build_inputs_with_special_tokens(wins[i]), dtype=np.int32) for i in sel]
+
+
+def collate(chunks, pad, device):
+    import torch
+    L = max(len(c) for c in chunks)
+    ids = np.full((len(chunks), L), pad, dtype=np.int64)
+    mask = np.zeros((len(chunks), L), dtype=np.int64)
+    for i, c in enumerate(chunks):
+        ids[i, :len(c)] = c
+        mask[i, :len(c)] = 1
+    return torch.from_numpy(ids).to(device), torch.from_numpy(mask).to(device)
+
+
+# ============================================================ dati
+def load_trait_csv(path, trait, a):
+    df = pd.read_csv(path)
+    ac = pick(df, AUTHOR_C, a.author_col, what="autore")
+    tc = pick(df, TEXT_C, a.text_col, what="testo")
+    lc = a.label_col or (trait if trait in df.columns else pick(df, ["label", "y", "target"], what="label"))
+    sc = pick(df, SYN_C, a.synthetic_col, required=False)
+    rc = pick(df, SRC_C, a.source_col, required=False)
+    out = pd.DataFrame({
+        "author": df[ac].astype(str),
+        "text": df[tc],
+        "y": pd.to_numeric(df[lc], errors="coerce"),
+    })
+    out["synthetic"] = to_bool(df[sc]) if sc else False
+    out["group"] = df[rc].fillna(df[ac]).astype(str) if rc else out["author"]
+    if sc and not rc:
+        print(f"  [warn] {path.name}: righe sintetiche senza colonna 'source author': non posso "
+              f"garantire l'assenza di leakage train/val. Usa --source-col.")
+    out = out.dropna(subset=["y"]).reset_index(drop=True)
+    out["y"] = out["y"].astype(int)
+    return out
+
+
+def split_groups(df, val_size, seed, limit_authors=None):
+    real = df[~df["synthetic"]]
+    g = real.groupby("group")["y"].first()
+    rng = np.random.RandomState(seed)
+    if limit_authors and len(g) > limit_authors:
+        keep = rng.choice(g.index.values, limit_authors, replace=False)
+        g = g.loc[keep]
+        df = df[df["group"].isin(set(keep))]
+    from sklearn.model_selection import train_test_split
+    strat = g.values if g.value_counts().min() >= 2 else None
+    tr_g, va_g = train_test_split(g.index.values, test_size=val_size, random_state=seed, stratify=strat)
+    tr = df[df["group"].isin(set(tr_g))].reset_index(drop=True)
+    va = df[(df["group"].isin(set(va_g))) & (~df["synthetic"])].reset_index(drop=True)
+    return tr, va
+
+
+FINAL_CACHE = {}
+
+
+def find_final(root, strat, a):
+    if a.final_csv:
+        return Path(a.final_csv)
+    for base in (root / strat, root):
+        hits = sorted(base.glob(a.final_glob))
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(f"Nessun final trovato in {root / strat} o {root} (glob '{a.final_glob}'). "
+                            f"Usa --final-csv.")
+
+
+def load_final(path, tok, a):
+    key = str(path)
+    if key in FINAL_CACHE:
+        return FINAL_CACHE[key]
+    df = pd.read_csv(path)
+    ac = pick(df, AUTHOR_C, a.author_col, what="autore (final)")
+    tc = pick(df, TEXT_C, a.text_col, what="testo (final)")
+    print(f"  tokenizzo final: {path} ({len(df)} righe)")
+    pool = [build_chunks(tok, t, a) for t in df[tc]]
+    labels = {}
+    for tr in MBTI_TRAITS + B5_TRAITS:
+        if tr in df.columns:
+            v = pd.to_numeric(df[tr], errors="coerce")
+            if tr in B5_TRAITS and not v.dropna().isin([0, 1]).all():
+                v = (v > a.b5_threshold).astype(float).where(v.notna())
+            labels[tr] = v.values
+    FINAL_CACHE[key] = (df[ac].astype(str).values, pool, labels)
+    return FINAL_CACHE[key]
+
+
+# ============================================================ modello
+def make_model(name, dropout):
+    import torch.nn as nn
+    from transformers import AutoModel
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enc = AutoModel.from_pretrained(name)
+            self.drop = nn.Dropout(dropout)
+            self.head = nn.Linear(self.enc.config.hidden_size, 1)
+
+        def forward(self, ids, mask):
+            h = self.enc(input_ids=ids, attention_mask=mask).last_hidden_state
+            m = mask.unsqueeze(-1).to(h.dtype)
+            pooled = (h * m).sum(1) / m.sum(1).clamp(min=1)       # mean pooling
+            return self.head(self.drop(pooled)).squeeze(-1)
+
+    return Net()
+
+
+def predict(model, pool, a, pad, device, use_amp):
+    import torch
+    model.eval()
+    items = [(u, j) for u, ch in enumerate(pool) for j in evenly(len(ch), a.max_eval_chunks)]
+    probs, cnt = np.zeros(len(pool)), np.zeros(len(pool))
+    with torch.no_grad():
+        for i in range(0, len(items), a.eval_batch_size):
+            b = items[i:i + a.eval_batch_size]
+            ids, mask = collate([pool[u][j] for u, j in b], pad, device)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                lg = model(ids, mask)
+            p = torch.sigmoid(lg.float()).cpu().numpy()
+            for (u, _), pp in zip(b, p):
+                probs[u] += pp
+                cnt[u] += 1
+    return probs / np.maximum(cnt, 1)          # media delle probabilita' dei chunk
+
+
+def val_score(y, p):
+    if len(set(y)) < 2:
+        return float(((p >= .5).astype(int) == y).mean())
+    return float(fast_auc(np.asarray(y), np.asarray(p)))
+
+
+def train_one(a, tr, va, trait, run_dir, seed, tok, device, final):
+    import torch
+    import torch.nn as nn
+    set_seed(seed)
+    use_amp = a.amp and device.type == "cuda"
+    pad = tok.pad_token_id
+
+    print(f"  tokenizzo train ({len(tr)}) e val ({len(va)})")
+    tr_pool = [build_chunks(tok, t, a) for t in tr["text"]]
+    va_pool = [build_chunks(tok, t, a) for t in va["text"]]
+    ytr, yva = tr["y"].values, va["y"].values
+
+    n_pos, n_neg = int(ytr.sum()), int((1 - ytr).sum())
+    pw = float(np.clip(n_neg / max(n_pos, 1), a.pos_weight_min, a.pos_weight_max))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+
+    model = make_model(a.encoder, a.dropout).to(device)
+    nd = ("bias", "LayerNorm.weight", "layer_norm")
+    groups = []
+    for lr, mod in ((a.lr_encoder, model.enc), (a.lr_head, model.head)):
+        named = list(mod.named_parameters())
+        groups.append({"params": [p for n, p in named if not any(x in n for x in nd)],
+                       "lr": lr, "weight_decay": a.weight_decay})
+        groups.append({"params": [p for n, p in named if any(x in n for x in nd)],
+                       "lr": lr, "weight_decay": 0.0})
+    groups = [g for g in groups if g["params"]]
+    opt = torch.optim.AdamW(groups)
+
+    n_items = sum(min(len(c), a.chunks_per_author) for c in tr_pool)
+    steps_ep = math.ceil(n_items / a.batch_size)
+    total, warm = steps_ep * a.epochs, int(a.warmup * steps_ep * a.epochs)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: (s + 1) / max(1, warm) if s < warm else max(0.0, (total - s) / max(1, total - warm)))
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    rng = np.random.RandomState(seed)
+    best, best_ep, bad, hist = -1.0, -1, 0, []
+    ckpt = run_dir / "best.pt"
+    print(f"  train: {len(tr_pool)} unita', {n_items} chunk/epoca, {steps_ep} step/epoca, pos_weight={pw:.2f}")
+
+    for ep in range(a.epochs):
+        model.train()
+        items = [(u, int(j)) for u, ch in enumerate(tr_pool)
+                 for j in rng.choice(len(ch), min(len(ch), a.chunks_per_author), replace=False)]
+        order = rng.permutation(len(items))
+        t0, run_loss = time.time(), 0.0
+        for i in range(0, len(order), a.batch_size):
+            b = [items[k] for k in order[i:i + a.batch_size]]
+            ids, mask = collate([tr_pool[u][j] for u, j in b], pad, device)
+            y = torch.tensor([ytr[u] for u, _ in b], dtype=torch.float32, device=device)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                lg = model(ids, mask)
+            loss = loss_fn(lg.float(), y)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            run_loss += loss.item() * len(b)
+        pv = predict(model, va_pool, a, pad, device, use_amp)
+        score = val_score(yva, pv)
+        hist.append({"epoch": ep + 1, "train_loss": run_loss / len(items), "val_auc": score,
+                     "sec": round(time.time() - t0, 1)})
+        print(f"  ep {ep + 1}/{a.epochs} loss={hist[-1]['train_loss']:.4f} val_auc(autore)={score:.4f} "
+              f"({hist[-1]['sec']}s)")
+        if score > best:
+            best, best_ep, bad = score, ep + 1, 0
+            torch.save(model.state_dict(), ckpt)
+        else:
+            bad += 1
+            if bad >= a.patience:
+                print("  early stopping")
+                break
+
+    model.load_state_dict(torch.load(ckpt, map_location=device))
+    f_auth, f_pool, f_labels = final
+    pf = predict(model, f_pool, a, pad, device, use_amp)
+    out = pd.DataFrame({"author": f_auth, "y_true": f_labels.get(trait, np.full(len(f_auth), np.nan)),
+                        "prob": pf})
+    out = out.groupby("author", as_index=False).agg(y_true=("y_true", "first"), prob=("prob", "mean"))
+    out.to_csv(run_dir / "preds_final.csv", index=False)
+    json.dump({"trait": trait, "seed": seed, "best_epoch": best_ep, "best_val_auc": best,
+               "history": hist, "args": {k: str(v) for k, v in vars(a).items()}},
+              open(run_dir / "history.json", "w"), indent=1)
+    if not a.keep_ckpt:
+        ckpt.unlink(missing_ok=True)
+    del model, opt
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+# ============================================================ comando train
+def cmd_train(a):
+    import torch
+    from transformers import AutoTokenizer
+    roots = [Path(r) for r in a.roots]
+    names = [r.name for r in roots]
+    if len(set(names)) != len(names):
+        sys.exit("Le root devono avere nomi di cartella distinti (servono come chiave nei risultati).")
+    device = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    tok = None
+    plan = []
+    for root in roots:
+        strats = a.strategies or sorted(d.name for d in root.iterdir()
+                                        if d.is_dir() and any((d / f).is_dir() for f in FAMILIES))
+        for st in strats:
+            for fam in (a.families or list(FAMILIES)):
+                for tr in FAMILIES[fam]:
+                    if a.traits and tr not in a.traits:
+                        continue
+                    f = root / st / fam / f"{tr}_{a.suffix}.csv"
+                    if not f.exists():
+                        print(f"[manca] {f}")
+                        continue
+                    for seed in a.seeds:
+                        rd = Path(a.runs) / root.name / st / fam / tr / f"s{seed}"
+                        if a.limit_authors:
+                            rd = rd.with_name(rd.name + "__pilot")
+                        plan.append((root, st, fam, tr, seed, f, rd))
+    print(f"{len(plan)} run pianificati su {device}")
+    if a.dry_run:
+        for p in plan:
+            print(("[fatto]  " if (p[-1] / "preds_final.csv").exists() else "[da fare] "), *p[:5])
+        return
+    tok = AutoTokenizer.from_pretrained(a.encoder)
+    tok.model_max_length = 10 ** 9
+
+    for k, (root, st, fam, tr, seed, f, rd) in enumerate(plan, 1):
+        if (rd / "preds_final.csv").exists():
+            print(f"[{k}/{len(plan)}] salto (gia' fatto): {rd}")
+            continue
+        print(f"\n[{k}/{len(plan)}] {root.name}/{st}/{fam}/{tr} seed={seed}")
+        rd.mkdir(parents=True, exist_ok=True)
+        try:
+            df = load_trait_csv(f, tr, a)
+            trn, val = split_groups(df, a.val_size, a.split_seed, a.limit_authors)
+            final = load_final(find_final(root, st, a), tok, a)
+            overlap = set(trn["author"]) & set(final[0])
+            if overlap:
+                print(f"  [warn] {len(overlap)} autori del train sono anche nel final (leakage!)")
+            train_one(a, trn, val, tr, rd, seed, tok, device, final)
+        except Exception as e:                                  # un run fallito non blocca gli altri
+            print(f"  [ERRORE] {type(e).__name__}: {e}")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
+
+
+# ============================================================ metriche / evaluate
+def fast_auc(y, p):
+    npos = int(y.sum())
+    nneg = len(y) - npos
+    if npos == 0 or nneg == 0:
+        return np.nan
+    r = rankdata(p)
+    return (r[y == 1].sum() - npos * (npos + 1) / 2) / (npos * nneg)
+
+
+def metrics(y, p, thr=0.5):
+    yh = (p >= thr).astype(int)
+    tp = int(((yh == 1) & (y == 1)).sum()); tn = int(((yh == 0) & (y == 0)).sum())
+    fp = int(((yh == 1) & (y == 0)).sum()); fn = int(((yh == 0) & (y == 1)).sum())
+    n = len(y)
+    tpr = tp / (tp + fn) if tp + fn else np.nan
+    tnr = tn / (tn + fp) if tn + fp else np.nan
+    f1p = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
+    f1n = 2 * tn / (2 * tn + fn + fp) if 2 * tn + fn + fp else 0.0
+    den = math.sqrt(max((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn), 0))
+    mcc = (tp * tn - fp * fn) / den if den else 0.0
+    return [(tp + tn) / n, np.nanmean([tpr, tnr]), (f1p + f1n) / 2, f1p, mcc, fast_auc(y, p)]
+
+
+def trait_matrix(Y, P, thr):
+    return np.array([metrics(Y[:, t], P[:, t], thr) for t in range(Y.shape[1])])   # (T, M)
+
+
+def family_stats(Y, P, thr):
+    tm = trait_matrix(Y, P, thr)
+    exact = float(np.all((P >= thr).astype(int) == Y, axis=1).mean())
+    return tm, np.nanmean(tm, axis=0), exact
+
+
+def ci(x, axis=0):
+    return np.nanpercentile(x, 2.5, axis=axis), np.nanpercentile(x, 97.5, axis=axis)
+
+
+def cmd_evaluate(a):
+    runs = Path(a.runs)
+    rows = []
+    for f in runs.glob("*/*/*/*/s*/preds_final.csv"):
+        root, st, fam, tr, seed = f.relative_to(runs).parts[:5]
+        if seed.endswith("__pilot") and not a.include_pilot:
+            continue
+        d = pd.read_csv(f)
+        d.insert(0, "seed", seed)
+        for k, v in zip(("trait", "family", "strategy", "root"), (tr, fam, st, root)):
+            d.insert(0, k, v)
+        rows.append(d)
+    if not rows:
+        sys.exit(f"Nessuna predizione trovata in {runs}")
+    L = pd.concat(rows)
+    L["author"] = L["author"].astype(str)
+    # media delle probabilita' sui seed (ensemble) per (root, strategia, famiglia, trait, autore)
+    L = L.groupby(["root", "strategy", "family", "trait", "author"], as_index=False).agg(
+        y_true=("y_true", "first"), prob=("prob", "mean"), n_seeds=("seed", "nunique"))
+
+    out_t, out_f, out_d = [], [], []
+    rng = np.random.RandomState(a.boot_seed)
+    for (root, st), sub in L.groupby(["root", "strategy"]):
+        data = {}
+        for fam, traits in FAMILIES.items():
+            s = sub[sub["family"] == fam]
+            if s.empty:
+                continue
+            P = s.pivot(index="author", columns="trait", values="prob")
+            Y = s.pivot(index="author", columns="trait", values="y_true")
+            miss = [t for t in traits if t not in P.columns]
+            if miss:
+                print(f"[skip] {root}/{st}/{fam}: mancano i trait {miss}")
+                continue
+            data[fam] = (P[traits], Y[traits])
+        if not data:
+            continue
+        common = None
+        for P, Y in data.values():
+            ok = P.dropna().index.intersection(Y.dropna().index)
+            common = ok if common is None else common.intersection(ok)
+        if len(common) < 10:
+            print(f"[skip] {root}/{st}: solo {len(common)} autori in comune")
+            continue
+        n = len(common)
+        arr = {f: (P.loc[common].values.astype(float), Y.loc[common].values.astype(int))
+               for f, (P, Y) in data.items()}
+        idxs = rng.randint(0, n, (a.n_boot, n))
+        point = {f: family_stats(Y, P, a.threshold) for f, (P, Y) in arr.items()}
+        boot = {f: ([], [], []) for f in arr}
+        for idx in idxs:
+            for f, (P, Y) in arr.items():
+                tm, ag, ex = family_stats(Y[idx], P[idx], a.threshold)
+                boot[f][0].append(tm); boot[f][1].append(ag); boot[f][2].append(ex)
+        base = dict(root=root, strategy=st, n_authors=n)
+        for f, (P, Y) in arr.items():
+            tm, ag, ex = point[f]
+            btm, bag, bex = (np.array(x) for x in boot[f])
+            lo, hi = ci(btm)
+            for ti, tr in enumerate(FAMILIES[f]):
+                r = dict(base, family=f, trait=tr, prevalence=Y[:, ti].mean())
+                for mi, m in enumerate(METRICS):
+                    r[m] = tm[ti, mi]; r[m + "_lo"] = lo[ti, mi]; r[m + "_hi"] = hi[ti, mi]
+                out_t.append(r)
+            lo, hi = ci(bag)
+            r = dict(base, family=f)
+            for mi, m in enumerate(METRICS):
+                r[m] = ag[mi]; r[m + "_lo"] = lo[mi]; r[m + "_hi"] = hi[mi]
+            elo, ehi = ci(bex)
+            r.update(exact_match=ex, exact_match_lo=elo, exact_match_hi=ehi)
+            if f == "mbti":      # tipo a 4 lettere: coincide con exact_match sulle 4 dicotomie
+                r["type_accuracy_16class"] = ex
+            out_f.append(r)
+        if "mbti" in arr and "big_five" in arr:
+            diff = np.array(boot["big_five"][1]) - np.array(boot["mbti"][1])
+            d0 = point["big_five"][1] - point["mbti"][1]
+            lo, hi = ci(diff)
+            r = dict(base)
+            for mi, m in enumerate(METRICS):
+                r["diff_" + m] = d0[mi]; r["diff_" + m + "_lo"] = lo[mi]; r["diff_" + m + "_hi"] = hi[mi]
+            out_d.append(r)
+
+    outdir = Path(a.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    T, F, D = pd.DataFrame(out_t), pd.DataFrame(out_f), pd.DataFrame(out_d)
+    T.to_csv(outdir / "trait_metrics.csv", index=False)
+    F.to_csv(outdir / "family_metrics.csv", index=False)
+    D.to_csv(outdir / "diff_big5_minus_mbti.csv", index=False)
+    show = ["root", "strategy", "family", "n_authors", "macro_f1", "macro_f1_lo", "macro_f1_hi",
+            "auc", "balanced_accuracy", "mcc", "exact_match"]
+    if len(F):
+        print(F[show].sort_values("macro_f1", ascending=False).round(3).to_string(index=False))
+    if len(D):
+        print("\nDifferenza Big Five - MBTI (media sui trait):")
+        print(D[["root", "strategy", "diff_macro_f1", "diff_macro_f1_lo", "diff_macro_f1_hi",
+                 "diff_auc", "diff_auc_lo", "diff_auc_hi"]].round(3).to_string(index=False))
+    print(f"\nTabelle in {outdir}")
+
+
+# ============================================================ CLI
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    t = sp.add_parser("train")
+    t.add_argument("--roots", nargs="+", required=True)
+    t.add_argument("--runs", required=True)
+    t.add_argument("--strategies", nargs="*", help="default: tutte le sottocartelle trovate")
+    t.add_argument("--families", nargs="*", choices=list(FAMILIES))
+    t.add_argument("--traits", nargs="*")
+    t.add_argument("--suffix", default="full", help="X in <trait>_X.csv")
+    t.add_argument("--seeds", nargs="+", type=int, default=[11])
+    t.add_argument("--final-csv")
+    t.add_argument("--final-glob", default="final*.csv")
+    t.add_argument("--b5-threshold", type=float, default=50, help="soglia per binarizzare i percentili Big Five nel final")
+    for n in ("author", "text", "label", "synthetic", "source"):
+        t.add_argument(f"--{n}-col")
+    t.add_argument("--encoder", default="roberta-large")
+    t.add_argument("--dropout", type=float, default=0.3)
+    t.add_argument("--lr-encoder", type=float, default=1e-5)
+    t.add_argument("--lr-head", type=float, default=1e-3)
+    t.add_argument("--weight-decay", type=float, default=0.01)
+    t.add_argument("--clip", type=float, default=1.0)
+    t.add_argument("--warmup", type=float, default=0.06)
+    t.add_argument("--batch-size", type=int, default=16)
+    t.add_argument("--eval-batch-size", type=int, default=32)
+    t.add_argument("--epochs", type=int, default=10)
+    t.add_argument("--patience", type=int, default=2)
+    t.add_argument("--max-len", type=int, default=512)
+    t.add_argument("--chunks-per-author", type=int, default=4)
+    t.add_argument("--max-pool-chunks", type=int, default=32)
+    t.add_argument("--max-eval-chunks", type=int, default=16)
+    t.add_argument("--max-comments", type=int, default=4000)
+    t.add_argument("--max-chars", type=int, default=300_000)
+    t.add_argument("--pos-weight-min", type=float, default=0.5)
+    t.add_argument("--pos-weight-max", type=float, default=3.0)
+    t.add_argument("--no-amp", dest="amp", action="store_false")
+    t.add_argument("--val-size", type=float, default=0.2)
+    t.add_argument("--split-seed", type=int, default=11)
+    t.add_argument("--limit-authors", type=int, help="pilota: usa solo N autori (cartelle __pilot)")
+    t.add_argument("--keep-ckpt", action="store_true")
+    t.add_argument("--device")
+    t.add_argument("--dry-run", action="store_true")
+    t.set_defaults(fn=cmd_train)
+
+    e = sp.add_parser("evaluate")
+    e.add_argument("--runs", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--threshold", type=float, default=0.5)
+    e.add_argument("--n-boot", type=int, default=1000)
+    e.add_argument("--boot-seed", type=int, default=0)
+    e.add_argument("--include-pilot", action="store_true")
+    e.set_defaults(fn=cmd_evaluate)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
