@@ -4,8 +4,9 @@ scikit-learn
 imbalanced-learn
 gensim>=4.3.3
 nltk
-transformers
-torch
 pyyaml
 matplotlib
 scipy
+torch>=2.3
+transformers>=4.38
+

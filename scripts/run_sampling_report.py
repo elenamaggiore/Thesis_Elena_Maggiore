@@ -48,7 +48,7 @@ def main():
     rows = []
     for level in args.levels:
         for dataset in args.datasets:
-            path = Path(args.docs_dir) / f"documents_{level}_{dataset}.jsonl.gz"
+            path = Path(args.docs_dir) / level / f"documents_{dataset}.jsonl.gz"
             if not path.exists():
                 print(f"[{level}/{dataset}] documenti non trovati: {path}")
                 continue
