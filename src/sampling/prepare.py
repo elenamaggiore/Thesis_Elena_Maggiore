@@ -64,12 +64,25 @@ def _as_text_frame(df: pd.DataFrame, target: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def prepare_target(docs: pd.DataFrame, target: str, strategy, *, generator=None,
-                   cache: SyntheticCache | None = None, seed: int = 42, val_size: float = 0.2,
-                   gpt2_multiplier: float = 1.0, chunk_size: int = 5, max_chunks: int | None = 8,
-                   features: bool = True, preprocessing: str | None = None,
-                   gpt2_input: str | None = None,
-                   w2v_params: dict | None = None, smote_params: dict | None = None) -> PreparedTarget:
+def prepare_target(
+    docs: pd.DataFrame,
+    target: str,
+    strategy,
+    *,
+    generator=None,
+    cache: SyntheticCache | None = None,
+    synthetic_docs: pd.DataFrame | None = None,
+    seed: int = 42,
+    val_size: float = 0.2,
+    gpt2_multiplier: float = 1.0,
+    chunk_size: int = 5,
+    max_chunks: int | None = 8,
+    features: bool = True,
+    preprocessing: str | None = None,
+    gpt2_input: str | None = None,
+    w2v_params: dict | None = None,
+    smote_params: dict | None = None,
+) -> PreparedTarget:
     s: Strategy = STRATEGIES[strategy] if isinstance(strategy, str) else strategy
     prep_kind = preprocessing or s.preprocessing
     docs = docs.reset_index(drop=True).copy()
@@ -87,25 +100,48 @@ def prepare_target(docs: pd.DataFrame, target: str, strategy, *, generator=None,
               "real_docs": _counts(docs[target])}
 
     if s.leakage:
-        # --- come nel paper: augmentation su TUTTI, poi split di righe (LEAKAGE) ---
-        syn = augment_minority(docs, target, generator, **aug_kw)
+        # Augmentation su tutti i documenti, poi split di righe.
+        if s.gpt2:
+            if synthetic_docs is None:
+                raise RuntimeError(
+                    "CSV dei documenti sintetici non fornito."
+                )
+            syn = synthetic_docs.copy()
+        else:
+            syn = pd.DataFrame()
+
         allrows = pd.concat([docs, syn], ignore_index=True)
-        report["synthetic_added"] = int(len(syn))
+        report["synthetic_added"] = len(syn)
+
         tr, va = stratified_split(allrows[target], val_size, seed)
         train, val = allrows.iloc[tr], allrows.iloc[va]
+
     else:
-        # --- split per autore PRIMA di qualunque augmentation ---
+        # Split per autore prima dell'augmentation.
         tr, va = stratified_split(docs[target], val_size, seed)
         train, val = docs.iloc[tr], docs.iloc[va]
+
         report["train_before_balancing"] = _counts(train[target])
+
         if s.undersample:
             keep = undersample_indices(train[target], seed=seed)
             train = train.iloc[keep]
             report["train_after_undersampling"] = _counts(train[target])
+
         if s.gpt2:
-            syn = augment_minority(train.reset_index(drop=True), target, generator, **aug_kw)
+            if synthetic_docs is None:
+                raise RuntimeError(
+                    "CSV dei documenti sintetici non fornito."
+                )
+
+            train_authors = set(train["author"])
+
+            syn = synthetic_docs[
+                synthetic_docs["source_author"].isin(train_authors)
+            ].copy()
+
             train = pd.concat([train, syn], ignore_index=True)
-            report["synthetic_added"] = int(len(syn))
+            report["synthetic_added"] = len(syn)
 
     train, val = _as_text_frame(train, target), _as_text_frame(val, target)
     report["train_text_level"] = _counts(train["y"])
